@@ -122,6 +122,83 @@ app.get('/debug/db', async (req, res) => {
 });
 
 
+
+
+// Detailed API key validation debug (temporary)
+app.get('/debug/validate/:apiKey', async (req, res) => {
+    const apiKey = req.params.apiKey;
+    const results = { steps: [], timings: {} };
+    let conn;
+    
+    try {
+        const start = Date.now();
+        conn = await database.pool.getConnection();
+        results.timings.getConnection = Date.now() - start;
+        
+        // Step 1: Get API key
+        let t = Date.now();
+        const [keyRows] = await conn.execute(
+            'SELECT id, user_id, name, permissions, allowed_ips, is_active, expires_at FROM api_keys WHERE `key` = ? LIMIT 1',
+            [apiKey]
+        );
+        results.timings.step1_apiKey = Date.now() - t;
+        results.steps.push({ step: 'api_key', found: keyRows.length > 0, data: keyRows[0] || null });
+        
+        if (keyRows.length === 0) {
+            conn.release();
+            return res.json({ ...results, error: 'API key not found' });
+        }
+        
+        const userId = keyRows[0].user_id;
+        
+        // Step 2: Get user
+        t = Date.now();
+        const [userRows] = await conn.execute(
+            'SELECT id, name, email, is_active FROM users WHERE id = ? LIMIT 1',
+            [userId]
+        );
+        results.timings.step2_user = Date.now() - t;
+        results.steps.push({ step: 'user', found: userRows.length > 0, data: userRows[0] || null });
+        
+        if (userRows.length === 0) {
+            conn.release();
+            return res.json({ ...results, error: 'User not found' });
+        }
+        
+        // Step 3: Get subscription
+        t = Date.now();
+        const [subRows] = await conn.execute(
+            'SELECT id, plan_id, status, ends_at FROM subscriptions WHERE user_id = ? AND status = "active" LIMIT 1',
+            [userId]
+        );
+        results.timings.step3_subscription = Date.now() - t;
+        results.steps.push({ step: 'subscription', found: subRows.length > 0, data: subRows[0] || null });
+        
+        // Step 4: Get plan (if subscription exists)
+        if (subRows.length > 0) {
+            t = Date.now();
+            const [planRows] = await conn.execute(
+                'SELECT id, name, slug, websocket_access FROM plans WHERE id = ? LIMIT 1',
+                [subRows[0].plan_id]
+            );
+            results.timings.step4_plan = Date.now() - t;
+            results.steps.push({ step: 'plan', found: planRows.length > 0, data: planRows[0] || null });
+        }
+        
+        conn.release();
+        results.totalTime = Date.now() - start;
+        results.overall = 'success';
+        
+    } catch (error) {
+        if (conn) conn.release();
+        results.error = error.message;
+        results.overall = 'failed';
+    }
+    
+    res.json(results);
+});
+
+
 // =============================================================================
 // AUTHENTICATED ENDPOINTS
 // =============================================================================
