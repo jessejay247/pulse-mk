@@ -538,10 +538,12 @@ dataIngestion.onTick((tick) => {
 // =============================================================================
 
 // Store recent ticks in memory for /api/ticks endpoint
+// Use a fixed-size circular buffer to prevent memory growth
+const MAX_TICKS = 50; // Reduced from 100
 let recentTicks = [];
-const MAX_TICKS = 100;
+let tickIndex = 0;
 
-// Listen to data ingestion ticks and store them
+// Listen to data ingestion ticks and store them (memory-efficient circular buffer)
 dataIngestion.onTick((tick) => {
     const tickData = {
         symbol: tick.symbol,
@@ -550,10 +552,14 @@ dataIngestion.onTick((tick) => {
         timestamp: tick.timestamp,
         originalSymbol: tick.displaySymbol
     };
-    recentTicks.unshift(tickData);
-    if (recentTicks.length > MAX_TICKS) {
-        recentTicks = recentTicks.slice(0, MAX_TICKS);
+    
+    // Circular buffer - overwrites old entries instead of growing
+    if (recentTicks.length < MAX_TICKS) {
+        recentTicks.push(tickData);
+    } else {
+        recentTicks[tickIndex % MAX_TICKS] = tickData;
     }
+    tickIndex++;
 });
 
 // GET /api/candles/:symbol/:timeframe - Backward compatible candles endpoint

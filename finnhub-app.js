@@ -1,5 +1,5 @@
 // =============================================================================
-// finnhub-app.js - Data Ingestion Service with Market Hours
+// finnhub-app.js - Data Ingestion Service with Market Hours (Memory Optimized)
 // =============================================================================
 
 require('dotenv').config();
@@ -9,7 +9,9 @@ const cron = require('node-cron');
 const database = require('./database');
 const { SYMBOLS, getSymbolByFinnhub, toInternalSymbol } = require('./config/symbols');
 const { isMarketOpenForSymbol } = require('./config/market-hours');
-const gapRecovery = require('./services/gap-recovery');
+
+// Skip gap recovery on free tier to save memory - can be enabled on paid plans
+const ENABLE_GAP_RECOVERY = process.env.ENABLE_GAP_RECOVERY === 'true';
 
 class FinnhubDataIngestion {
     constructor() {
@@ -20,23 +22,87 @@ class FinnhubDataIngestion {
         this.maxReconnectAttempts = 10;
         this.tickCallbacks = [];
         this.isConnected = false;
+        
+        // Memory management
+        this.maxBufferSize = 500; // Limit buffer entries
+        this.lastCleanup = Date.now();
     }
 
     async init() {
         await database.connect();
         
-        // Recover any gaps from server downtime
-        await gapRecovery.recoverOnStartup();
-        
-        // Start periodic gap checks
-        gapRecovery.startPeriodicCheck(60); // Check every hour
+        // Only run gap recovery if explicitly enabled (uses lots of memory)
+        if (ENABLE_GAP_RECOVERY) {
+            try {
+                const gapRecovery = require('./services/gap-recovery');
+                await gapRecovery.recoverOnStartup();
+                gapRecovery.startPeriodicCheck(120); // Less frequent on free tier
+            } catch (error) {
+                console.log('⚠️ Gap recovery disabled or failed:', error.message);
+            }
+        } else {
+            console.log('ℹ️ Gap recovery disabled for memory optimization');
+        }
         
         await this.initWebSocket();
         this.startCleanupJob();
         this.startBufferFlushJob();
         
+        // Periodic memory cleanup
+        this.startMemoryCleanup();
+        
         console.log('🚀 Finnhub Data Ingestion Started!');
         console.log(`📈 Tracking ${Object.keys(SYMBOLS).length} symbols`);
+        this.logMemoryUsage();
+    }
+
+    logMemoryUsage() {
+        const used = process.memoryUsage();
+        console.log(`📊 Memory: RSS=${Math.round(used.rss / 1024 / 1024)}MB, Heap=${Math.round(used.heapUsed / 1024 / 1024)}MB/${Math.round(used.heapTotal / 1024 / 1024)}MB`);
+    }
+
+    startMemoryCleanup() {
+        // Run garbage collection hints and cleanup every 5 minutes
+        setInterval(() => {
+            this.cleanupBuffers();
+            this.logMemoryUsage();
+            
+            // Force GC if available (run node with --expose-gc)
+            if (global.gc) {
+                global.gc();
+            }
+        }, 5 * 60 * 1000);
+    }
+
+    cleanupBuffers() {
+        const now = Date.now();
+        const maxAge = 5 * 60 * 1000; // 5 minutes
+        let cleaned = 0;
+        
+        for (const [key, candle] of this.candleBuffers.entries()) {
+            if (now - candle.lastUpdate > maxAge) {
+                this.saveCandleToDatabase(candle);
+                this.candleBuffers.delete(key);
+                cleaned++;
+            }
+        }
+        
+        // If still too many buffers, force cleanup oldest ones
+        if (this.candleBuffers.size > this.maxBufferSize) {
+            const entries = Array.from(this.candleBuffers.entries())
+                .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate);
+            
+            const toRemove = entries.slice(0, entries.length - this.maxBufferSize);
+            for (const [key, candle] of toRemove) {
+                this.saveCandleToDatabase(candle);
+                this.candleBuffers.delete(key);
+                cleaned++;
+            }
+        }
+        
+        if (cleaned > 0) {
+            console.log(`🧹 Cleaned ${cleaned} stale buffers, ${this.candleBuffers.size} remaining`);
+        }
     }
 
     async initWebSocket() {
@@ -66,12 +132,14 @@ class FinnhubDataIngestion {
                 const message = JSON.parse(data);
                 
                 if (message.type === 'trade' && message.data) {
-                    message.data.forEach(trade => this.processTrade(trade));
+                    // Process only first few trades per batch to reduce memory pressure
+                    const trades = message.data.slice(0, 5);
+                    trades.forEach(trade => this.processTrade(trade));
                 } else if (message.type === 'ping') {
                     this.ws.send(JSON.stringify({ type: 'pong' }));
                 }
             } catch (error) {
-                console.error('❌ Error processing message:', error);
+                console.error('❌ Error processing message:', error.message);
             }
         });
 
@@ -81,7 +149,7 @@ class FinnhubDataIngestion {
         });
 
         this.ws.on('close', () => {
-            console.log('📌 Finnhub WebSocket disconnected');
+            console.log('🔌 Finnhub WebSocket disconnected');
             this.isConnected = false;
             this.scheduleReconnect();
         });
@@ -113,7 +181,6 @@ class FinnhubDataIngestion {
         // Get our symbol config
         const symbolInfo = getSymbolByFinnhub(finnhubSymbol);
         if (!symbolInfo) {
-            // Unknown symbol, skip
             return;
         }
 
@@ -121,11 +188,9 @@ class FinnhubDataIngestion {
         const internalSymbol = toInternalSymbol(symbol);
         const tradeTime = new Date(timestamp);
 
-        // ====== MARKET HOURS CHECK ======
+        // Market hours check
         const marketStatus = isMarketOpenForSymbol(type, tradeTime);
         if (!marketStatus.open) {
-            // Market is closed, don't create candles
-            // But still emit tick for real-time display
             this.emitTick({
                 symbol: internalSymbol,
                 displaySymbol: symbol,
@@ -148,25 +213,34 @@ class FinnhubDataIngestion {
             marketClosed: false
         });
 
-        // Update candles for all timeframes
-        ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'].forEach(timeframe => {
+        // Only update essential timeframes to save memory
+        // Reduced from 7 timeframes to 4 for free tier
+        const timeframes = process.env.NODE_ENV === 'production' 
+            ? ['M1', 'M5', 'H1', 'D1']  // Production: fewer timeframes
+            : ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1']; // Dev: all timeframes
+            
+        timeframes.forEach(timeframe => {
             this.updateCandle(internalSymbol, timeframe, tradeTime, price, volume || 0);
         });
     }
 
     emitTick(tick) {
-        // Notify all registered callbacks
-        this.tickCallbacks.forEach(callback => {
+        // Limit number of callbacks to prevent memory leaks
+        const callbacks = this.tickCallbacks.slice(0, 10);
+        callbacks.forEach(callback => {
             try {
                 callback(tick);
             } catch (error) {
-                console.error('❌ Error in tick callback:', error);
+                console.error('❌ Error in tick callback:', error.message);
             }
         });
     }
 
     onTick(callback) {
-        this.tickCallbacks.push(callback);
+        // Limit total callbacks
+        if (this.tickCallbacks.length < 10) {
+            this.tickCallbacks.push(callback);
+        }
     }
 
     getCandleStartTime(timestamp, timeframe) {
@@ -204,6 +278,11 @@ class FinnhubDataIngestion {
         const bufferKey = `${symbol}_${timeframe}_${candleStart.getTime()}`;
 
         if (!this.candleBuffers.has(bufferKey)) {
+            // Check buffer size before adding
+            if (this.candleBuffers.size >= this.maxBufferSize) {
+                this.cleanupBuffers();
+            }
+            
             this.candleBuffers.set(bufferKey, {
                 symbol,
                 timeframe,
@@ -226,9 +305,9 @@ class FinnhubDataIngestion {
             candle.lastUpdate = Date.now();
         }
 
-        // Save after threshold
+        // Save more frequently to keep buffer small
         const candle = this.candleBuffers.get(bufferKey);
-        if (candle.tradeCount >= 10 || (Date.now() - candle.lastUpdate) > 30000) {
+        if (candle.tradeCount >= 5 || (Date.now() - candle.lastUpdate) > 15000) {
             this.saveCandleToDatabase(candle);
         }
     }
@@ -263,18 +342,26 @@ class FinnhubDataIngestion {
         // Cleanup old candles every hour
         cron.schedule('0 * * * *', async () => {
             await database.cleanupOldCandles();
+            this.logMemoryUsage();
         });
     }
 
     startBufferFlushJob() {
-        // Flush stale buffers every minute
-        cron.schedule('* * * * *', () => {
+        // Flush stale buffers every 30 seconds (more frequent for memory management)
+        cron.schedule('*/30 * * * * *', () => {
             const now = Date.now();
+            let flushed = 0;
+            
             for (const [key, candle] of this.candleBuffers.entries()) {
-                if (now - candle.lastUpdate > 60000) {
+                if (now - candle.lastUpdate > 30000) {
                     this.saveCandleToDatabase(candle);
                     this.candleBuffers.delete(key);
+                    flushed++;
                 }
+            }
+            
+            if (flushed > 0) {
+                console.log(`💾 Flushed ${flushed} candles to DB`);
             }
         });
     }
@@ -295,6 +382,7 @@ class FinnhubDataIngestion {
         for (const candle of this.candleBuffers.values()) {
             await this.saveCandleToDatabase(candle);
         }
+        this.candleBuffers.clear();
         
         if (this.heartbeatInterval) {
             clearInterval(this.heartbeatInterval);

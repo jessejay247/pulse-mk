@@ -1,11 +1,11 @@
-# services:
-#   - type: web
-#     name: pulse-market-api
-#     env: node
-#     plan: free
-#     buildCommand: npm install
-#     startCommand: node api-server.js
-#     healthCheckPath: /api/health
-#     envVars:
-#       - key: NODE_ENV
-#         value: production
+services:
+  - type: web
+    name: pulse-market-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node --max-old-space-size=450 api-server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
