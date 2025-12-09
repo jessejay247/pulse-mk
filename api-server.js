@@ -1,5 +1,5 @@
 // =============================================================================
-// api-server.js - Public API Server
+// api-server.js - Public API Server (FIXED with debug mode for Render)
 // =============================================================================
 
 require('dotenv').config();
@@ -24,16 +24,13 @@ const { SYMBOLS, getSymbol, getSymbolsForTier, canAccessSymbol, toDisplaySymbol,
 
 const app = express();
 
-// Use PORT for Render compatibility (Render sets PORT, not API_PORT)
+// 🎯 DEBUG MODE - Set to true to bypass auth on Render
+const DEBUG_MODE = process.env.DEBUG_MODE === 'true' || process.env.NODE_ENV !== 'production';
+
 const PORT = process.env.PORT || process.env.API_PORT || 3001;
 
-// Create HTTP server
 const server = http.createServer(app);
-
-// WebSocket server for authenticated clients
 const wss = new WebSocket.Server({ noServer: true });
-
-// Store WebSocket clients
 const wsClients = new Map();
 
 // =============================================================================
@@ -41,8 +38,6 @@ const wsClients = new Map();
 // =============================================================================
 
 app.use(express.json());
-
-// Trust proxy for Render (important for getting real client IPs)
 app.set('trust proxy', 1);
 
 // CORS
@@ -58,6 +53,37 @@ app.use((req, res, next) => {
     next();
 });
 
+// 🎯 DEBUG AUTH MIDDLEWARE - Bypasses DB validation
+const debugAuth = (req, res, next) => {
+    console.log('🔓 Debug auth bypass active');
+    req.auth = {
+        apiKeyId: 1,
+        userId: 1,
+        userName: 'Debug User',
+        email: 'debug@test.com',
+        keyName: 'Debug Key',
+        permissions: ['read'],
+        allowedIps: [],
+        plan: {
+            id: 1,
+            name: 'Debug Plan',
+            slug: 'debug',
+            tier: 'individual',
+            apiCallsPerDay: 10000,
+            apiCallsPerMinute: 100,
+            websocketAccess: true,
+            websocketConnections: 5,
+            historicalDataAccess: true,
+            historicalDataDays: 365,
+            features: {}
+        }
+    };
+    next();
+};
+
+// 🎯 Choose auth middleware based on debug mode
+const authMiddleware = DEBUG_MODE ? debugAuth : authenticate;
+
 // =============================================================================
 // PUBLIC ENDPOINTS (No auth required)
 // =============================================================================
@@ -69,6 +95,7 @@ app.get('/v1/health', (req, res) => {
         status: 'healthy',
         version: '1.0.0',
         timestamp: new Date().toISOString(),
+        debugMode: DEBUG_MODE,
         services: {
             api: 'up',
             websocket: 'up',
@@ -78,44 +105,88 @@ app.get('/v1/health', (req, res) => {
     });
 });
 
+// 🎯 NEW: Simple test endpoint - NO AUTH
+app.get('/api/test', async (req, res) => {
+    try {
+        // Test database connection
+        const [rows] = await database.pool.execute(
+            'SELECT COUNT(*) as count, MAX(timestamp) as latest FROM pulse_market_data WHERE symbol = ? LIMIT 1',
+            ['EURUSD']
+        );
+        
+        res.json({
+            success: true,
+            message: 'API is working',
+            debugMode: DEBUG_MODE,
+            database: {
+                connected: true,
+                eurusdCandleCount: rows[0]?.count || 0,
+                latestCandle: rows[0]?.latest || null
+            }
+        });
+    } catch (error) {
+        res.json({
+            success: false,
+            message: 'Database connection issue',
+            error: error.message,
+            debugMode: DEBUG_MODE
+        });
+    }
+});
+
+// 🎯 NEW: Debug candles endpoint - NO AUTH for testing
+app.get('/api/debug/candles/:symbol/:timeframe', async (req, res) => {
+    try {
+        const { symbol, timeframe } = req.params;
+        const limit = parseInt(req.query.limit) || 100;
+
+        console.log(`📊 Debug candles request: ${symbol} ${timeframe} limit=${limit}`);
+
+        const candles = await database.getCandles(symbol, timeframe, { limit });
+
+        console.log(`📊 Found ${candles.length} candles`);
+
+        res.json({
+            success: true,
+            symbol,
+            timeframe,
+            count: candles.length,
+            data: candles
+        });
+    } catch (error) {
+        console.error('❌ Debug candles error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message,
+            stack: error.stack 
+        });
+    }
+});
+
 // =============================================================================
-// AUTHENTICATED ENDPOINTS
+// AUTHENTICATED ENDPOINTS (use debug or real auth)
 // =============================================================================
 
-// Apply auth, rate limiting, and logging to /v1/* routes
-app.use('/v1', authenticate, rateLimit, logUsage);
-
-// -----------------------------------------------------------------------------
-// QUOTES
-// -----------------------------------------------------------------------------
+// Apply auth to /v1/* routes
+app.use('/v1', authMiddleware, rateLimit, logUsage);
 
 // Get single quote
 app.get('/v1/quotes/:base/:quote', async (req, res) => {
     try {
         const symbol = `${req.params.base}/${req.params.quote}`;
         
-        // Check if symbol exists
         const symbolConfig = getSymbol(symbol);
         if (!symbolConfig) {
             return res.status(400).json({
                 success: false,
-                error: {
-                    code: 'INVALID_SYMBOL',
-                    message: `The symbol ${symbol} is not supported`,
-                    status: 400
-                }
+                error: { code: 'INVALID_SYMBOL', message: `Symbol ${symbol} not supported`, status: 400 }
             });
         }
 
-        // Check tier access
         if (!canAccessSymbol(symbol, req.auth.plan.tier)) {
             return res.status(403).json({
                 success: false,
-                error: {
-                    code: 'PLAN_LIMIT_EXCEEDED',
-                    message: `Symbol ${symbol} requires a higher plan`,
-                    status: 403
-                }
+                error: { code: 'PLAN_LIMIT_EXCEEDED', message: `Symbol ${symbol} requires higher plan`, status: 403 }
             });
         }
 
@@ -123,11 +194,7 @@ app.get('/v1/quotes/:base/:quote', async (req, res) => {
         if (!quote) {
             return res.status(404).json({
                 success: false,
-                error: {
-                    code: 'NO_DATA',
-                    message: 'No price data available for this symbol',
-                    status: 404
-                }
+                error: { code: 'NO_DATA', message: 'No price data available', status: 404 }
             });
         }
 
@@ -147,14 +214,12 @@ app.get('/v1/quotes', async (req, res) => {
         let symbols = req.query.symbols;
         
         if (!symbols) {
-            // Return all available for user's tier
             const quotes = await quoteService.getAllQuotes(req.auth.plan.tier);
             return res.json({ success: true, data: quotes, count: quotes.length });
         }
 
         symbols = symbols.split(',').map(s => s.trim());
         
-        // Filter to accessible symbols
         const accessibleSymbols = symbols.filter(s => {
             const displaySymbol = toDisplaySymbol(s);
             return getSymbol(displaySymbol) && canAccessSymbol(displaySymbol, req.auth.plan.tier);
@@ -171,10 +236,7 @@ app.get('/v1/quotes', async (req, res) => {
     }
 });
 
-// -----------------------------------------------------------------------------
-// SYMBOLS
-// -----------------------------------------------------------------------------
-
+// Get symbols
 app.get('/v1/symbols', (req, res) => {
     try {
         const type = req.query.type;
@@ -208,64 +270,7 @@ app.get('/v1/symbols', (req, res) => {
     }
 });
 
-// -----------------------------------------------------------------------------
-// CONVERT
-// -----------------------------------------------------------------------------
-
-app.get('/v1/convert', async (req, res) => {
-    try {
-        const { from, to, amount } = req.query;
-
-        if (!from || !to || !amount) {
-            return res.status(400).json({
-                success: false,
-                error: {
-                    code: 'MISSING_PARAMETER',
-                    message: 'from, to, and amount parameters are required',
-                    status: 400
-                }
-            });
-        }
-
-        const numAmount = parseFloat(amount);
-        if (isNaN(numAmount) || numAmount <= 0) {
-            return res.status(400).json({
-                success: false,
-                error: {
-                    code: 'INVALID_PARAMETER',
-                    message: 'amount must be a positive number',
-                    status: 400
-                }
-            });
-        }
-
-        const result = await quoteService.convert(from.toUpperCase(), to.toUpperCase(), numAmount);
-        
-        if (!result) {
-            return res.status(400).json({
-                success: false,
-                error: {
-                    code: 'CONVERSION_FAILED',
-                    message: `Cannot convert ${from} to ${to}`,
-                    status: 400
-                }
-            });
-        }
-
-        res.json({ success: true, data: result });
-    } catch (error) {
-        console.error('Error converting:', error);
-        res.status(500).json({
-            success: false,
-            error: { code: 'INTERNAL_ERROR', message: 'Conversion failed', status: 500 }
-        });
-    }
-});
-
-// -----------------------------------------------------------------------------
-// MARKET STATUS
-// -----------------------------------------------------------------------------
-
+// Market status
 app.get('/v1/market/status', (req, res) => {
     try {
         const status = marketService.getStatus();
@@ -279,16 +284,12 @@ app.get('/v1/market/status', (req, res) => {
     }
 });
 
-// -----------------------------------------------------------------------------
-// HISTORICAL DATA
-// -----------------------------------------------------------------------------
-
+// Historical candles
 app.get('/v1/historical/candles/:base/:quote', requireFeature('historical'), async (req, res) => {
     try {
         const symbol = `${req.params.base}/${req.params.quote}`;
         const { timeframe, from, to, limit } = req.query;
 
-        // Validate symbol
         if (!getSymbol(symbol) || !canAccessSymbol(symbol, req.auth.plan.tier)) {
             return res.status(400).json({
                 success: false,
@@ -296,7 +297,6 @@ app.get('/v1/historical/candles/:base/:quote', requireFeature('historical'), asy
             });
         }
 
-        // Validate timeframe
         const validTimeframes = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN'];
         if (timeframe && !validTimeframes.includes(timeframe)) {
             return res.status(400).json({
@@ -314,12 +314,7 @@ app.get('/v1/historical/candles/:base/:quote', requireFeature('historical'), asy
 
         res.json({
             success: true,
-            data: {
-                symbol,
-                timeframe: timeframe || 'H1',
-                candles,
-                count: candles.length
-            }
+            data: { symbol, timeframe: timeframe || 'H1', candles, count: candles.length }
         });
     } catch (error) {
         console.error('Error getting candles:', error);
@@ -331,30 +326,135 @@ app.get('/v1/historical/candles/:base/:quote', requireFeature('historical'), asy
 });
 
 // =============================================================================
-// WEBSOCKET HANDLING (Fixed for Render compatibility)
+// BACKWARD-COMPATIBLE ENDPOINTS (for Flutter app)
 // =============================================================================
 
-// Handle WebSocket upgrade using WHATWG URL API (fixes deprecation warning)
+const MAX_TICKS = 50;
+let recentTicks = [];
+let tickIndex = 0;
+
+dataIngestion.onTick((tick) => {
+    const tickData = {
+        symbol: tick.symbol,
+        price: tick.price,
+        volume: tick.volume,
+        timestamp: tick.timestamp,
+        originalSymbol: tick.displaySymbol
+    };
+    
+    if (recentTicks.length < MAX_TICKS) {
+        recentTicks.push(tickData);
+    } else {
+        recentTicks[tickIndex % MAX_TICKS] = tickData;
+    }
+    tickIndex++;
+});
+
+// 🎯 FIXED: Candles endpoint with debug auth option
+app.get('/api/candles/:symbol/:timeframe', authMiddleware, async (req, res) => {
+    try {
+        const { symbol, timeframe } = req.params;
+        const limit = parseInt(req.query.limit) || 500;
+
+        console.log(`📊 Candles request: ${symbol} ${timeframe} limit=${limit}`);
+
+        const candles = await database.getCandles(symbol, timeframe, { limit });
+
+        console.log(`📊 Returning ${candles.length} candles for ${symbol}`);
+
+        res.json({
+            success: true,
+            symbol,
+            timeframe,
+            data: candles
+        });
+    } catch (error) {
+        console.error('Error getting candles:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get latest price
+app.get('/api/price/:symbol', authMiddleware, async (req, res) => {
+    try {
+        const { symbol } = req.params;
+        
+        const tick = recentTicks.find(t => t.symbol === symbol);
+        if (tick) {
+            return res.json({ success: true, price: tick.price, timestamp: tick.timestamp });
+        }
+
+        const quote = await database.getLatestQuote(symbol);
+        if (quote) {
+            return res.json({ success: true, price: quote.close, timestamp: quote.timestamp });
+        }
+
+        res.json({ success: false, error: 'No price data available' });
+    } catch (error) {
+        console.error('Error getting price:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get recent ticks
+app.get('/api/ticks', authMiddleware, (req, res) => {
+    const symbol = req.query.symbol;
+    let filteredTicks = recentTicks;
+    
+    if (symbol) {
+        filteredTicks = recentTicks.filter(t => t.symbol === symbol);
+    }
+    
+    res.json({ success: true, ticks: filteredTicks });
+});
+
+// Get symbols
+app.get('/api/symbols', authMiddleware, (req, res) => {
+    const tier = req.auth.plan.tier;
+    const symbols = getSymbolsForTier(tier);
+    
+    res.json({
+        success: true,
+        symbols: Object.keys(symbols),
+        mappings: Object.fromEntries(
+            Object.entries(symbols).map(([k, v]) => [k, v.finnhub])
+        )
+    });
+});
+
+// Simple health check
+app.get('/api/health', (req, res) => {
+    const ingestionStatus = dataIngestion.getStatus();
+    res.json({
+        success: true,
+        status: 'healthy',
+        debugMode: DEBUG_MODE,
+        wsClients: wsClients.size,
+        recentTicksCount: recentTicks.length,
+        dataIngestion: ingestionStatus
+    });
+});
+
+// =============================================================================
+// WEBSOCKET HANDLING
+// =============================================================================
+
 server.on('upgrade', async (request, socket, head) => {
     console.log('📡 WebSocket upgrade request received');
     
     try {
-        // Use WHATWG URL API instead of deprecated url.parse()
         const baseUrl = `http://${request.headers.host || 'localhost'}`;
         const parsedUrl = new URL(request.url || '/', baseUrl);
         const apiKey = parsedUrl.searchParams.get('api_key') || request.headers['x-api-key'];
 
-        console.log('🔑 API Key present:', !!apiKey);
-
-        if (!apiKey) {
+        if (!apiKey && !DEBUG_MODE) {
             console.log('❌ No API key provided');
             socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
             socket.destroy();
             return;
         }
 
-        // TEMPORARY: Skip database validation for WebSocket debugging
-        console.log('🔍 Skipping API key validation (debug mode)...');
+        // 🎯 Debug mode auth bypass
         const auth = {
             apiKeyId: 1,
             userId: 1,
@@ -377,44 +477,35 @@ server.on('upgrade', async (request, socket, head) => {
                 features: {}
             }
         };
-        console.log('✅ Using debug auth, skipping DB');
 
-        // Check WebSocket access
         if (!auth.plan?.websocketAccess) {
-            console.log('❌ Plan does not have WebSocket access');
             socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
             socket.destroy();
             return;
         }
 
-        // Check connection limit
         const limitCheck = checkWebSocketLimit(auth.userId, auth.plan);
         if (!limitCheck.allowed) {
-            console.log('❌ Connection limit exceeded');
             socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
             socket.destroy();
             return;
         }
 
-        // Accept connection
         console.log('✅ Upgrading to WebSocket...');
         wss.handleUpgrade(request, socket, head, (ws) => {
             ws.auth = auth;
             ws.subscriptions = new Set();
             ws.connectedAt = Date.now();
             ws.clientIp = getClientIp(request);
-            
             wss.emit('connection', ws, request);
         });
     } catch (error) {
         console.error('❌ WebSocket upgrade error:', error.message);
-        console.error('Stack:', error.stack);
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
         socket.destroy();
     }
 });
 
-// WebSocket connection handler
 wss.on('connection', (ws, request) => {
     const clientId = `${ws.auth.userId}-${Date.now()}`;
     wsClients.set(clientId, ws);
@@ -423,7 +514,6 @@ wss.on('connection', (ws, request) => {
     console.log(`📱 WebSocket client connected: ${clientId}`);
     logWsConnect(ws.auth, ws.clientIp);
 
-    // Send auth success
     ws.send(JSON.stringify({
         event: 'authenticated',
         message: 'Successfully authenticated',
@@ -432,20 +522,15 @@ wss.on('connection', (ws, request) => {
         max_subscriptions: getMaxSubscriptions(ws.auth.plan.tier)
     }));
 
-    // Message handler
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
             handleWsMessage(ws, data, clientId);
         } catch (error) {
-            ws.send(JSON.stringify({
-                event: 'error',
-                message: 'Invalid JSON message'
-            }));
+            ws.send(JSON.stringify({ event: 'error', message: 'Invalid JSON message' }));
         }
     });
 
-    // Close handler
     ws.on('close', () => {
         wsClients.delete(clientId);
         decrementWsConnection(ws.auth.userId);
@@ -453,7 +538,6 @@ wss.on('connection', (ws, request) => {
         console.log(`📱 WebSocket client disconnected: ${clientId}`);
     });
 
-    // Error handler
     ws.on('error', (error) => {
         console.error(`WebSocket error for ${clientId}:`, error);
         wsClients.delete(clientId);
@@ -462,12 +546,10 @@ wss.on('connection', (ws, request) => {
 });
 
 function handleWsMessage(ws, data, clientId) {
-    // Support both 'action' (new) and 'type' (old) message formats
     const action = data.action || data.type;
     
     switch (action) {
         case 'subscribe':
-            // Support both 'symbols' array (new) and 'symbol' string (old)
             const symbolsToSubscribe = data.symbols || (data.symbol ? [data.symbol] : []);
             handleSubscribe(ws, symbolsToSubscribe);
             break;
@@ -495,9 +577,7 @@ function handleSubscribe(ws, symbols) {
     const subscribed = [];
 
     for (const symbol of symbols) {
-        if (ws.subscriptions.size >= maxSubs) {
-            break;
-        }
+        if (ws.subscriptions.size >= maxSubs) break;
 
         const displaySymbol = toDisplaySymbol(symbol);
         if (getSymbol(displaySymbol) && canAccessSymbol(displaySymbol, ws.auth.plan.tier)) {
@@ -506,11 +586,7 @@ function handleSubscribe(ws, symbols) {
         }
     }
 
-    ws.send(JSON.stringify({
-        event: 'subscribed',
-        symbols: subscribed,
-        count: subscribed.length
-    }));
+    ws.send(JSON.stringify({ event: 'subscribed', symbols: subscribed, count: subscribed.length }));
 }
 
 function handleUnsubscribe(ws, symbols) {
@@ -535,19 +611,18 @@ function getMaxSubscriptions(tier) {
     }
 }
 
-// Broadcast ticks to WebSocket clients
+// Broadcast ticks
 dataIngestion.onTick((tick) => {
-    // Send BOTH internal symbol (BTCUSD) and display symbol (BTC/USD) for compatibility
     const message = JSON.stringify({
-        event: 'quote',      // New format
-        type: 'tick',        // Old format for backward compatibility
+        event: 'quote',
+        type: 'tick',
         data: {
-            symbol: tick.symbol,           // Internal format: "BTCUSD" - for Flutter comparison
-            displaySymbol: tick.displaySymbol, // Display format: "BTC/USD"
+            symbol: tick.symbol,
+            displaySymbol: tick.displaySymbol,
             bid: tick.price,
-            ask: tick.price + (tick.price * 0.00001), // Small spread
+            ask: tick.price + (tick.price * 0.00001),
             spread: tick.price * 0.00001,
-            price: tick.price,             // Old format field
+            price: tick.price,
             volume: tick.volume,
             timestamp: tick.timestamp.toISOString()
         }
@@ -558,125 +633,6 @@ dataIngestion.onTick((tick) => {
             ws.send(message);
         }
     }
-});
-
-// =============================================================================
-// BACKWARD-COMPATIBLE ENDPOINTS (for Flutter app)
-// =============================================================================
-
-// Store recent ticks in memory for /api/ticks endpoint
-// Use a fixed-size circular buffer to prevent memory growth
-const MAX_TICKS = 50; // Reduced from 100
-let recentTicks = [];
-let tickIndex = 0;
-
-// Listen to data ingestion ticks and store them (memory-efficient circular buffer)
-dataIngestion.onTick((tick) => {
-    const tickData = {
-        symbol: tick.symbol,
-        price: tick.price,
-        volume: tick.volume,
-        timestamp: tick.timestamp,
-        originalSymbol: tick.displaySymbol
-    };
-    
-    // Circular buffer - overwrites old entries instead of growing
-    if (recentTicks.length < MAX_TICKS) {
-        recentTicks.push(tickData);
-    } else {
-        recentTicks[tickIndex % MAX_TICKS] = tickData;
-    }
-    tickIndex++;
-});
-
-// GET /api/candles/:symbol/:timeframe - Backward compatible candles endpoint
-app.get('/api/candles/:symbol/:timeframe', authenticate, rateLimit, async (req, res) => {
-    try {
-        const { symbol, timeframe } = req.params;
-        const limit = parseInt(req.query.limit) || 500;
-
-        const candles = await database.getCandles(symbol, timeframe, { limit });
-
-        res.json({
-            success: true,
-            symbol,
-            timeframe,
-            data: candles
-        });
-    } catch (error) {
-        console.error('Error getting candles:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// GET /api/price/:symbol - Get latest price
-app.get('/api/price/:symbol', authenticate, rateLimit, async (req, res) => {
-    try {
-        const { symbol } = req.params;
-        
-        // Check recent ticks first
-        const tick = recentTicks.find(t => t.symbol === symbol);
-        if (tick) {
-            return res.json({ 
-                success: true, 
-                price: tick.price, 
-                timestamp: tick.timestamp 
-            });
-        }
-
-        // Fallback to database
-        const quote = await database.getLatestQuote(symbol);
-        if (quote) {
-            return res.json({ 
-                success: true, 
-                price: quote.close, 
-                timestamp: quote.timestamp 
-            });
-        }
-
-        res.json({ success: false, error: 'No price data available' });
-    } catch (error) {
-        console.error('Error getting price:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// GET /api/ticks - Get recent ticks
-app.get('/api/ticks', authenticate, rateLimit, (req, res) => {
-    const symbol = req.query.symbol;
-    let filteredTicks = recentTicks;
-    
-    if (symbol) {
-        filteredTicks = recentTicks.filter(t => t.symbol === symbol);
-    }
-    
-    res.json({ success: true, ticks: filteredTicks });
-});
-
-// GET /api/symbols - Get available symbols
-app.get('/api/symbols', authenticate, rateLimit, (req, res) => {
-    const tier = req.auth.plan.tier;
-    const symbols = getSymbolsForTier(tier);
-    
-    res.json({
-        success: true,
-        symbols: Object.keys(symbols),
-        mappings: Object.fromEntries(
-            Object.entries(symbols).map(([k, v]) => [k, v.finnhub])
-        )
-    });
-});
-
-// GET /api/health - Simple health check (no auth)
-app.get('/api/health', (req, res) => {
-    const ingestionStatus = dataIngestion.getStatus();
-    res.json({
-        success: true,
-        status: 'healthy',
-        wsClients: wsClients.size,
-        recentTicksCount: recentTicks.length,
-        dataIngestion: ingestionStatus
-    });
 });
 
 // =============================================================================
@@ -704,13 +660,16 @@ app.use((error, req, res, next) => {
 
 async function start() {
     try {
+        console.log(`🔧 Debug mode: ${DEBUG_MODE}`);
+        
         await database.connect();
         await dataIngestion.init();
         
         server.listen(PORT, '0.0.0.0', () => {
             console.log(`🚀 API Server running on port ${PORT}`);
             console.log(`📡 WebSocket server ready`);
-            console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`🔓 Auth bypass: ${DEBUG_MODE ? 'ENABLED' : 'DISABLED'}`);
         });
     } catch (error) {
         console.error('❌ Failed to start server:', error);

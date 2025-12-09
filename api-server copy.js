@@ -115,5 +115,4 @@
 
 
 
-
-// node scripts/seed-historical.js EURGBP EURJPY GBPJPY BTCUSD --months 1 --timeframe D1
+// node scripts/seed-historical.js EURGBP EURJPY GBPJPY --months 1 --timeframe D1
