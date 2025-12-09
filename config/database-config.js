@@ -7,7 +7,7 @@
 
 
 module.exports = {
-    host: '195.35.53.3',      // Your MySQL host
+    host: 'srv1395.hstgr.io',      // Your MySQL host
     user: 'u753127729_pulse',           // Your MySQL username
     password: 'Hxtx=M52da>3',          // Your MySQL password
     database: 'u753127729_pulse'  // Database name
