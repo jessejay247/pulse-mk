@@ -78,6 +78,50 @@ app.get('/v1/health', (req, res) => {
     });
 });
 
+// Database connectivity test (temporary - remove in production)
+app.get('/debug/db', async (req, res) => {
+    const results = { steps: [] };
+    
+    try {
+        // Step 1: Pool exists?
+        results.steps.push({ step: 'pool_exists', success: !!database.pool });
+        
+        // Step 2: Can get connection?
+        const conn = await database.pool.getConnection();
+        results.steps.push({ step: 'get_connection', success: true });
+        
+        // Step 3: Simple query
+        const [rows] = await conn.execute('SELECT 1 as test');
+        results.steps.push({ step: 'simple_query', success: true, result: rows[0] });
+        
+        // Step 4: Check api_keys table
+        const [keyCount] = await conn.execute('SELECT COUNT(*) as cnt FROM api_keys');
+        results.steps.push({ step: 'api_keys_count', success: true, count: keyCount[0].cnt });
+        
+        // Step 5: Check specific key exists
+        const [keyRows] = await conn.execute(
+            'SELECT id, user_id, is_active FROM api_keys WHERE `key` = ? LIMIT 1',
+            ['fx_cwJOBrpLZPQuvhBQdXOxTVICoHbA3Paf']
+        );
+        results.steps.push({ 
+            step: 'find_api_key', 
+            success: true, 
+            found: keyRows.length > 0,
+            data: keyRows[0] || null
+        });
+        
+        conn.release();
+        results.overall = 'success';
+        
+    } catch (error) {
+        results.error = error.message;
+        results.overall = 'failed';
+    }
+    
+    res.json(results);
+});
+
+
 // =============================================================================
 // AUTHENTICATED ENDPOINTS
 // =============================================================================
