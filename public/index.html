@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-time Market Data</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0f0f23;
+            color: #00ff00;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .market-sections {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+        }
+        .market-section {
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .section-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            border-bottom: 1px solid #00ff00;
+            padding-bottom: 5px;
+        }
+        .tick-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 8px;
+        }
+        .tick-card {
+            background: #252545;
+            border: 1px solid #444;
+            border-radius: 5px;
+            padding: 8px;
+            font-size: 12px;
+        }
+        .tick-card.crypto { border-left: 3px solid #ff9900; }
+        .tick-card.forex { border-left: 3px solid #00ff00; }
+        .tick-card.stock { border-left: 3px solid #0099ff; }
+        .tick-card .symbol {
+            font-weight: bold;
+            font-size: 13px;
+        }
+        .tick-card .price {
+            font-size: 14px;
+            color: #ffff00;
+        }
+        .tick-card .volume {
+            color: #888;
+            font-size: 11px;
+        }
+        .tick-card .time {
+            color: #666;
+            font-size: 10px;
+        }
+        .stats {
+            background: #1a1a2e;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚡ Real-time Market Data</h1>
+            <p>Live prices from Finnhub WebSocket - Crypto trades 24/7!</p>
+        </div>
+        
+        <div class="market-sections">
+            <div class="market-section">
+                <div class="section-title">₿ Cryptocurrencies (24/7)</div>
+                <div class="tick-grid" id="cryptoContainer"></div>
+            </div>
+            
+            <div class="market-section">
+                <div class="section-title">💵 Forex</div>
+                <div class="tick-grid" id="forexContainer"></div>
+            </div>
+            
+            <div class="market-section">
+                <div class="section-title">📈 Stocks</div>
+                <div class="tick-grid" id="stockContainer"></div>
+            </div>
+        </div>
+        
+        <div class="stats">
+            <div>Total Ticks: <span id="totalTicks">0</span></div>
+            <div>Last Update: <span id="lastUpdate">-</span></div>
+            <div>Active Symbols: <span id="activeSymbols">0</span></div>
+        </div>
+    </div>
+
+    <script>
+        let totalTicks = 0;
+        let activeSymbols = new Set();
+        
+        function getAssetClass(symbol) {
+            if (symbol.includes('BTC') || symbol.includes('ETH') || symbol.includes('ADA') || 
+                symbol.includes('DOT') || symbol.includes('SOL') || symbol.includes('XRP') ||
+                symbol.includes('DOGE') || symbol.includes('LTC')) {
+                return 'crypto';
+            } else if (symbol.includes('USD') && !symbol.includes('BTC') && !symbol.includes('ETH')) {
+                return 'forex';
+            } else {
+                return 'stock';
+            }
+        }
+        
+        function updateTicks() {
+            fetch('/api/ticks')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        const cryptoContainer = document.getElementById('cryptoContainer');
+                        const forexContainer = document.getElementById('forexContainer');
+                        const stockContainer = document.getElementById('stockContainer');
+                        
+                        cryptoContainer.innerHTML = '';
+                        forexContainer.innerHTML = '';
+                        stockContainer.innerHTML = '';
+                        
+                        data.ticks.forEach(tick => {
+                            const assetClass = getAssetClass(tick.symbol);
+                            activeSymbols.add(tick.symbol);
+                            
+                            const tickElement = document.createElement('div');
+                            tickElement.className = `tick-card ${assetClass}`;
+                            tickElement.innerHTML = `
+                                <div class="symbol">${tick.symbol}</div>
+                                <div class="price">$${parseFloat(tick.price).toFixed(assetClass === 'forex' ? 5 : 2)}</div>
+                                <div class="volume">Vol: ${tick.volume || '0'}</div>
+                                <div class="time">${new Date(tick.timestamp).toLocaleTimeString()}</div>
+                            `;
+                            
+                            if (assetClass === 'crypto') {
+                                cryptoContainer.appendChild(tickElement);
+                            } else if (assetClass === 'forex') {
+                                forexContainer.appendChild(tickElement);
+                            } else {
+                                stockContainer.appendChild(tickElement);
+                            }
+                        });
+                        
+                        document.getElementById('totalTicks').textContent = totalTicks;
+                        document.getElementById('activeSymbols').textContent = activeSymbols.size;
+                        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                    }
+                })
+                .catch(error => console.error('Error fetching ticks:', error));
+        }
+
+        // Update every second
+        setInterval(updateTicks, 1000);
+        updateTicks();
+
+        // Increment tick counter
+        setInterval(() => {
+            totalTicks++;
+        }, 1000);
+    </script>
+</body>
+</html>
