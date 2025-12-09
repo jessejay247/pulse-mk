@@ -336,28 +336,39 @@ app.get('/v1/historical/candles/:base/:quote', requireFeature('historical'), asy
 
 // Handle WebSocket upgrade using WHATWG URL API (fixes deprecation warning)
 server.on('upgrade', async (request, socket, head) => {
+    console.log('📡 WebSocket upgrade request received');
+    
     try {
         // Use WHATWG URL API instead of deprecated url.parse()
-        const baseUrl = `http://${request.headers.host}`;
-        const parsedUrl = new URL(request.url, baseUrl);
+        const baseUrl = `http://${request.headers.host || 'localhost'}`;
+        const parsedUrl = new URL(request.url || '/', baseUrl);
         const apiKey = parsedUrl.searchParams.get('api_key') || request.headers['x-api-key'];
 
+        console.log('🔑 API Key present:', !!apiKey);
+
         if (!apiKey) {
+            console.log('❌ No API key provided');
             socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
             socket.destroy();
             return;
         }
 
         // Validate API key
+        console.log('🔍 Validating API key...');
         const auth = await database.validateApiKey(apiKey);
+        
         if (!auth) {
+            console.log('❌ Invalid API key');
             socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
             socket.destroy();
             return;
         }
+        
+        console.log('✅ API key valid, user:', auth.userId, 'plan:', auth.plan?.name);
 
         // Check WebSocket access
-        if (!auth.plan.websocketAccess) {
+        if (!auth.plan?.websocketAccess) {
+            console.log('❌ Plan does not have WebSocket access');
             socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
             socket.destroy();
             return;
@@ -366,12 +377,14 @@ server.on('upgrade', async (request, socket, head) => {
         // Check connection limit
         const limitCheck = checkWebSocketLimit(auth.userId, auth.plan);
         if (!limitCheck.allowed) {
+            console.log('❌ Connection limit exceeded');
             socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
             socket.destroy();
             return;
         }
 
         // Accept connection
+        console.log('✅ Upgrading to WebSocket...');
         wss.handleUpgrade(request, socket, head, (ws) => {
             ws.auth = auth;
             ws.subscriptions = new Set();
@@ -381,7 +394,8 @@ server.on('upgrade', async (request, socket, head) => {
             wss.emit('connection', ws, request);
         });
     } catch (error) {
-        console.error('WebSocket upgrade error:', error);
+        console.error('❌ WebSocket upgrade error:', error.message);
+        console.error('Stack:', error.stack);
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
         socket.destroy();
     }
