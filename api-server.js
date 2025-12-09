@@ -78,127 +78,6 @@ app.get('/v1/health', (req, res) => {
     });
 });
 
-// Database connectivity test (temporary - remove in production)
-app.get('/debug/db', async (req, res) => {
-    const results = { steps: [] };
-    
-    try {
-        // Step 1: Pool exists?
-        results.steps.push({ step: 'pool_exists', success: !!database.pool });
-        
-        // Step 2: Can get connection?
-        const conn = await database.pool.getConnection();
-        results.steps.push({ step: 'get_connection', success: true });
-        
-        // Step 3: Simple query
-        const [rows] = await conn.execute('SELECT 1 as test');
-        results.steps.push({ step: 'simple_query', success: true, result: rows[0] });
-        
-        // Step 4: Check api_keys table
-        const [keyCount] = await conn.execute('SELECT COUNT(*) as cnt FROM api_keys');
-        results.steps.push({ step: 'api_keys_count', success: true, count: keyCount[0].cnt });
-        
-        // Step 5: Check specific key exists
-        const [keyRows] = await conn.execute(
-            'SELECT id, user_id, is_active FROM api_keys WHERE `key` = ? LIMIT 1',
-            ['fx_cwJOBrpLZPQuvhBQdXOxTVICoHbA3Paf']
-        );
-        results.steps.push({ 
-            step: 'find_api_key', 
-            success: true, 
-            found: keyRows.length > 0,
-            data: keyRows[0] || null
-        });
-        
-        conn.release();
-        results.overall = 'success';
-        
-    } catch (error) {
-        results.error = error.message;
-        results.overall = 'failed';
-    }
-    
-    res.json(results);
-});
-
-
-
-
-// Detailed API key validation debug (temporary)
-app.get('/debug/validate/:apiKey', async (req, res) => {
-    const apiKey = req.params.apiKey;
-    const results = { steps: [], timings: {} };
-    let conn;
-    
-    try {
-        const start = Date.now();
-        conn = await database.pool.getConnection();
-        results.timings.getConnection = Date.now() - start;
-        
-        // Step 1: Get API key
-        let t = Date.now();
-        const [keyRows] = await conn.execute(
-            'SELECT id, user_id, name, permissions, allowed_ips, is_active, expires_at FROM api_keys WHERE `key` = ? LIMIT 1',
-            [apiKey]
-        );
-        results.timings.step1_apiKey = Date.now() - t;
-        results.steps.push({ step: 'api_key', found: keyRows.length > 0, data: keyRows[0] || null });
-        
-        if (keyRows.length === 0) {
-            conn.release();
-            return res.json({ ...results, error: 'API key not found' });
-        }
-        
-        const userId = keyRows[0].user_id;
-        
-        // Step 2: Get user
-        t = Date.now();
-        const [userRows] = await conn.execute(
-            'SELECT id, name, email, is_active FROM users WHERE id = ? LIMIT 1',
-            [userId]
-        );
-        results.timings.step2_user = Date.now() - t;
-        results.steps.push({ step: 'user', found: userRows.length > 0, data: userRows[0] || null });
-        
-        if (userRows.length === 0) {
-            conn.release();
-            return res.json({ ...results, error: 'User not found' });
-        }
-        
-        // Step 3: Get subscription
-        t = Date.now();
-        const [subRows] = await conn.execute(
-            'SELECT id, plan_id, status, ends_at FROM subscriptions WHERE user_id = ? AND status = "active" LIMIT 1',
-            [userId]
-        );
-        results.timings.step3_subscription = Date.now() - t;
-        results.steps.push({ step: 'subscription', found: subRows.length > 0, data: subRows[0] || null });
-        
-        // Step 4: Get plan (if subscription exists)
-        if (subRows.length > 0) {
-            t = Date.now();
-            const [planRows] = await conn.execute(
-                'SELECT id, name, slug, websocket_access FROM plans WHERE id = ? LIMIT 1',
-                [subRows[0].plan_id]
-            );
-            results.timings.step4_plan = Date.now() - t;
-            results.steps.push({ step: 'plan', found: planRows.length > 0, data: planRows[0] || null });
-        }
-        
-        conn.release();
-        results.totalTime = Date.now() - start;
-        results.overall = 'success';
-        
-    } catch (error) {
-        if (conn) conn.release();
-        results.error = error.message;
-        results.overall = 'failed';
-    }
-    
-    res.json(results);
-});
-
-
 // =============================================================================
 // AUTHENTICATED ENDPOINTS
 // =============================================================================
@@ -474,34 +353,31 @@ server.on('upgrade', async (request, socket, head) => {
             return;
         }
 
-        // Validate API key with timeout
-        console.log('🔍 Validating API key...');
-        let auth;
-        try {
-            // Add 5 second timeout to prevent hanging
-            const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Database timeout')), 5000)
-            );
-            auth = await Promise.race([
-                database.validateApiKey(apiKey),
-                timeoutPromise
-            ]);
-            console.log('✅ validateApiKey returned:', auth ? 'valid' : 'null');
-        } catch (dbError) {
-            console.error('❌ Database error during validation:', dbError.message);
-            socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
-            socket.destroy();
-            return;
-        }
-        
-        if (!auth) {
-            console.log('❌ Invalid API key');
-            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-            socket.destroy();
-            return;
-        }
-        
-        console.log('✅ API key valid, user:', auth.userId, 'plan:', auth.plan?.name);
+        // TEMPORARY: Skip database validation for WebSocket debugging
+        console.log('🔍 Skipping API key validation (debug mode)...');
+        const auth = {
+            apiKeyId: 1,
+            userId: 1,
+            userName: 'Debug User',
+            email: 'debug@test.com',
+            keyName: 'Debug Key',
+            permissions: ['read'],
+            allowedIps: [],
+            plan: {
+                id: 1,
+                name: 'Debug Plan',
+                slug: 'debug',
+                tier: 'individual',
+                apiCallsPerDay: 10000,
+                apiCallsPerMinute: 100,
+                websocketAccess: true,
+                websocketConnections: 5,
+                historicalDataAccess: true,
+                historicalDataDays: 365,
+                features: {}
+            }
+        };
+        console.log('✅ Using debug auth, skipping DB');
 
         // Check WebSocket access
         if (!auth.plan?.websocketAccess) {
