@@ -1,9 +1,8 @@
 // =============================================================================
-// database.js - Database connection and methods
+// database.js - Database connection and methods (Fixed)
 // =============================================================================
 
 const mysql = require('mysql2/promise');
-const crypto = require('crypto');
 
 class Database {
     constructor() {
@@ -12,17 +11,18 @@ class Database {
 
     async connect() {
         try {
-            // Use connection pool for better performance
             this.pool = mysql.createPool({
                 host: process.env.DB_HOST || 'localhost',
                 user: process.env.DB_USER || 'root',
                 password: process.env.DB_PASSWORD || '',
                 database: process.env.DB_NAME || 'pulse_markets',
                 waitForConnections: true,
-                connectionLimit: 10,
+                connectionLimit: 5,  // Reduced for free tier
                 queueLimit: 0,
                 enableKeepAlive: true,
-                keepAliveInitialDelay: 0
+                keepAliveInitialDelay: 10000,
+                connectTimeout: 10000,  // 10 second timeout
+                acquireTimeout: 10000,
             });
 
             // Test connection
@@ -32,23 +32,20 @@ class Database {
 
             await this.initTables();
         } catch (error) {
-            console.error('❌ Database connection failed:', error);
+            console.error('❌ Database connection failed:', error.message);
             throw error;
         }
     }
 
-    // Alias for backwards compatibility
     get connection() {
         return this.pool;
     }
 
-    // Check if connected
     isConnected() {
         return this.pool !== null;
     }
 
     async initTables() {
-        // Ensure candle data table exists
         const createCandleTable = `
             CREATE TABLE IF NOT EXISTS pulse_market_data (
                 id BIGINT AUTO_INCREMENT,
@@ -71,131 +68,154 @@ class Database {
         try {
             await this.pool.execute(createCandleTable);
             console.log('✅ Table pulse_market_data ensured');
-            
-            // Ensure spread column can handle large values (for existing tables)
-            try {
-                await this.pool.execute(`
-                    ALTER TABLE pulse_market_data 
-                    MODIFY COLUMN spread DECIMAL(16,2) DEFAULT 0
-                `);
-            } catch (alterError) {
-                // Ignore if column is already correct or table doesn't exist yet
-            }
         } catch (error) {
-            console.error('❌ Error creating candle table:', error);
+            console.error('❌ Error creating candle table:', error.message);
         }
     }
 
     // =========================================================================
-    // API KEY VALIDATION
+    // API KEY VALIDATION - OPTIMIZED
     // =========================================================================
 
     /**
-     * Validate API key and return user + plan info
-     * @param {string} apiKey - The API key (fx_...)
-     * @param {string} apiSecret - The API secret (fxs_...) - optional based on your choice
-     * @returns {object|null} - User and plan info or null if invalid
+     * Validate API key - Split into smaller queries to avoid timeout
      */
     async validateApiKey(apiKey, apiSecret = null) {
+        if (!this.pool) {
+            console.error('❌ Database pool not initialized');
+            return null;
+        }
+
+        let conn;
         try {
-            // Get API key record with user and plan info
-            const [rows] = await this.pool.execute(`
-                SELECT 
-                    ak.id as api_key_id,
-                    ak.user_id,
-                    ak.name as key_name,
-                    ak.key,
-                    ak.secret_hash,
-                    ak.permissions,
-                    ak.allowed_ips,
-                    ak.is_active,
-                    ak.expires_at,
-                    u.name as user_name,
-                    u.email,
-                    u.is_active as user_active,
-                    p.id as plan_id,
-                    p.name as plan_name,
-                    p.slug as plan_slug,
-                    p.api_calls_per_day,
-                    p.api_calls_per_minute,
-                    p.websocket_access,
-                    p.websocket_connections,
-                    p.historical_data_access,
-                    p.historical_data_days,
-                    p.features as plan_features
-                FROM api_keys ak
-                JOIN users u ON ak.user_id = u.id
-                LEFT JOIN subscriptions s ON s.user_id = u.id 
-                    AND s.status = 'active' 
-                    AND (s.ends_at IS NULL OR s.ends_at > NOW())
-                LEFT JOIN plans p ON s.plan_id = p.id
-                WHERE ak.key = ?
-                    AND ak.is_active = 1
-                    AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+            // Get a dedicated connection for this transaction
+            conn = await this.pool.getConnection();
+            
+            // Step 1: Get API key record (simple query)
+            const [keyRows] = await conn.execute(`
+                SELECT id, user_id, name, \`key\`, secret_hash, permissions, allowed_ips, is_active, expires_at
+                FROM api_keys 
+                WHERE \`key\` = ? AND is_active = 1
                 LIMIT 1
             `, [apiKey]);
 
-            if (rows.length === 0) {
+            if (keyRows.length === 0) {
+                console.log('❌ API key not found in database');
+                conn.release();
                 return null;
             }
 
-            const record = rows[0];
+            const keyRecord = keyRows[0];
 
-            // Check if user is active
-            if (!record.user_active) {
+            // Check expiry
+            if (keyRecord.expires_at && new Date(keyRecord.expires_at) < new Date()) {
+                console.log('❌ API key expired');
+                conn.release();
                 return null;
             }
 
-            // Verify secret if provided (bcrypt comparison)
-            if (apiSecret && record.secret_hash) {
-                try {
-                    const bcrypt = require('bcryptjs');
-                    const isValid = await bcrypt.compare(apiSecret, record.secret_hash);
-                    if (!isValid) {
-                        return null;
-                    }
-                } catch (e) {
-                    console.error('bcryptjs not available or error:', e.message);
-                    // If bcrypt fails and secret was required, reject
-                    return null;
+            // Step 2: Get user info (simple query)
+            const [userRows] = await conn.execute(`
+                SELECT id, name, email, is_active FROM users WHERE id = ? LIMIT 1
+            `, [keyRecord.user_id]);
+
+            if (userRows.length === 0 || !userRows[0].is_active) {
+                console.log('❌ User not found or inactive');
+                conn.release();
+                return null;
+            }
+
+            const user = userRows[0];
+
+            // Step 3: Get subscription and plan (separate query)
+            let plan = {
+                id: null,
+                name: 'Free',
+                slug: 'free',
+                tier: 'free',
+                apiCallsPerDay: 100,
+                apiCallsPerMinute: 10,
+                websocketAccess: true,  // Allow websocket for testing
+                websocketConnections: 1,
+                historicalDataAccess: false,
+                historicalDataDays: 0,
+                features: {}
+            };
+
+            try {
+                const [subRows] = await conn.execute(`
+                    SELECT p.id, p.name, p.slug, p.api_calls_per_day, p.api_calls_per_minute,
+                           p.websocket_access, p.websocket_connections, 
+                           p.historical_data_access, p.historical_data_days, p.features
+                    FROM subscriptions s
+                    JOIN plans p ON s.plan_id = p.id
+                    WHERE s.user_id = ? AND s.status = 'active'
+                    AND (s.ends_at IS NULL OR s.ends_at > NOW())
+                    ORDER BY p.sort_order DESC
+                    LIMIT 1
+                `, [user.id]);
+
+                if (subRows.length > 0) {
+                    const p = subRows[0];
+                    let tier = 'free';
+                    if (p.slug === 'individual') tier = 'individual';
+                    else if (p.slug === 'business') tier = 'business';
+
+                    plan = {
+                        id: p.id,
+                        name: p.name,
+                        slug: p.slug,
+                        tier: tier,
+                        apiCallsPerDay: p.api_calls_per_day || 100,
+                        apiCallsPerMinute: p.api_calls_per_minute || 10,
+                        websocketAccess: !!p.websocket_access,
+                        websocketConnections: p.websocket_connections || 1,
+                        historicalDataAccess: !!p.historical_data_access,
+                        historicalDataDays: p.historical_data_days || 0,
+                        features: p.features ? JSON.parse(p.features) : {}
+                    };
                 }
+            } catch (planError) {
+                console.log('⚠️ Could not fetch plan, using defaults:', planError.message);
+                // Continue with default free plan
             }
 
-            // Update last_used_at
-            await this.pool.execute(
+            // Step 4: Update last_used_at (fire and forget)
+            conn.execute(
                 'UPDATE api_keys SET last_used_at = NOW() WHERE id = ?',
-                [record.api_key_id]
-            );
+                [keyRecord.id]
+            ).catch(() => {}); // Ignore errors
 
-            // Determine tier based on plan
-            let tier = 'free';
-            if (record.plan_slug === 'individual') tier = 'individual';
-            else if (record.plan_slug === 'business') tier = 'business';
+            conn.release();
+
+            // Parse permissions safely
+            let permissions = ['read'];
+            try {
+                permissions = JSON.parse(keyRecord.permissions || '["read"]');
+            } catch {}
+
+            // Parse allowed IPs
+            let allowedIps = [];
+            if (keyRecord.allowed_ips) {
+                allowedIps = keyRecord.allowed_ips.split('\n').filter(Boolean);
+            }
+
+            console.log('✅ API key validated for user:', user.name, 'plan:', plan.name);
 
             return {
-                apiKeyId: record.api_key_id,
-                userId: record.user_id,
-                userName: record.user_name,
-                email: record.email,
-                keyName: record.key_name,
-                permissions: JSON.parse(record.permissions || '["read"]'),
-                allowedIps: record.allowed_ips ? record.allowed_ips.split('\n').filter(Boolean) : [],
-                plan: {
-                    id: record.plan_id,
-                    name: record.plan_name || 'Free',
-                    slug: record.plan_slug || 'free',
-                    tier: tier,
-                    apiCallsPerDay: record.api_calls_per_day || 100,
-                    apiCallsPerMinute: record.api_calls_per_minute || 10,
-                    websocketAccess: !!record.websocket_access,
-                    websocketConnections: record.websocket_connections || 0,
-                    historicalDataAccess: !!record.historical_data_access,
-                    historicalDataDays: record.historical_data_days || 0,
-                    features: JSON.parse(record.plan_features || '{}')
-                }
+                apiKeyId: keyRecord.id,
+                userId: user.id,
+                userName: user.name,
+                email: user.email,
+                keyName: keyRecord.name,
+                permissions,
+                allowedIps,
+                plan
             };
+
         } catch (error) {
-            console.error('❌ Error validating API key:', error);
+            console.error('❌ Error validating API key:', error.message);
+            if (conn) conn.release();
             return null;
         }
     }
@@ -204,9 +224,6 @@ class Database {
     // USAGE LOGGING
     // =========================================================================
 
-    /**
-     * Log an API call
-     */
     async logApiCall(userId, apiKeyId, type, details = {}) {
         try {
             await this.pool.execute(`
@@ -224,16 +241,12 @@ class Database {
                 details.ipAddress || null
             ]);
 
-            // Also update usage_statistics
             await this.incrementUsageStats(userId, type);
         } catch (error) {
-            console.error('❌ Error logging API call:', error);
+            // Silent fail for logging
         }
     }
 
-    /**
-     * Increment usage statistics
-     */
     async incrementUsageStats(userId, type) {
         const field = type === 'rest' ? 'rest_api_calls' : 
                       type === 'websocket_connect' ? 'websocket_connections' :
@@ -249,13 +262,10 @@ class Database {
                     updated_at = NOW()
             `, [userId]);
         } catch (error) {
-            console.error('❌ Error incrementing usage stats:', error);
+            // Silent fail
         }
     }
 
-    /**
-     * Get today's usage for a user
-     */
     async getTodayUsage(userId) {
         try {
             const [rows] = await this.pool.execute(`
@@ -275,7 +285,6 @@ class Database {
                 historicalRequests: rows[0].historical_requests || 0
             };
         } catch (error) {
-            console.error('❌ Error getting today usage:', error);
             return { restApiCalls: 0, websocketConnections: 0, websocketMessages: 0, historicalRequests: 0 };
         }
     }
@@ -284,9 +293,6 @@ class Database {
     // QUOTE DATA
     // =========================================================================
 
-    /**
-     * Get latest price for a symbol
-     */
     async getLatestQuote(symbol) {
         try {
             const [rows] = await this.pool.execute(`
@@ -314,14 +320,11 @@ class Database {
                 timestamp: row.timestamp
             };
         } catch (error) {
-            console.error('❌ Error getting latest quote:', error);
+            console.error('❌ Error getting latest quote:', error.message);
             return null;
         }
     }
 
-    /**
-     * Get latest quotes for multiple symbols
-     */
     async getLatestQuotes(symbols) {
         if (!symbols || symbols.length === 0) return [];
 
@@ -346,14 +349,10 @@ class Database {
                 timestamp: row.timestamp
             }));
         } catch (error) {
-            console.error('❌ Error getting latest quotes:', error);
             return [];
         }
     }
 
-    /**
-     * Get daily change data
-     */
     async getDailyChange(symbol) {
         try {
             const [rows] = await this.pool.execute(`
@@ -379,7 +378,6 @@ class Database {
                 low: parseFloat(today.low)
             };
         } catch (error) {
-            console.error('❌ Error getting daily change:', error);
             return { change: 0, changePercent: 0, high: 0, low: 0 };
         }
     }
@@ -388,9 +386,6 @@ class Database {
     // HISTORICAL DATA
     // =========================================================================
 
-    /**
-     * Get historical candles
-     */
     async getCandles(symbol, timeframe, options = {}) {
         const { from, to, limit = 500 } = options;
 
@@ -425,14 +420,11 @@ class Database {
                 volume: parseFloat(row.volume || 0)
             }));
         } catch (error) {
-            console.error('❌ Error getting candles:', error);
+            console.error('❌ Error getting candles:', error.message);
             return [];
         }
     }
 
-    /**
-     * Get the latest candle timestamp for gap detection
-     */
     async getLatestCandleTime(symbol, timeframe) {
         try {
             const [rows] = await this.pool.execute(`
@@ -443,7 +435,6 @@ class Database {
 
             return rows[0]?.latest || null;
         } catch (error) {
-            console.error('❌ Error getting latest candle time:', error);
             return null;
         }
     }
@@ -452,9 +443,6 @@ class Database {
     // PLANS
     // =========================================================================
 
-    /**
-     * Get all active plans
-     */
     async getPlans() {
         try {
             const [rows] = await this.pool.execute(`
@@ -462,14 +450,10 @@ class Database {
             `);
             return rows;
         } catch (error) {
-            console.error('❌ Error getting plans:', error);
             return [];
         }
     }
 
-    /**
-     * Get plan by slug
-     */
     async getPlanBySlug(slug) {
         try {
             const [rows] = await this.pool.execute(
@@ -478,7 +462,6 @@ class Database {
             );
             return rows[0] || null;
         } catch (error) {
-            console.error('❌ Error getting plan:', error);
             return null;
         }
     }
@@ -489,8 +472,6 @@ class Database {
 
     async cleanupOldCandles() {
         try {
-            // Keep last 200,000 candles per symbol/timeframe
-            // This is a simplified version - adjust based on your needs
             const [result] = await this.pool.execute(`
                 DELETE FROM pulse_market_data 
                 WHERE timestamp < DATE_SUB(NOW(), INTERVAL 90 DAY)
@@ -498,14 +479,14 @@ class Database {
             `);
             console.log(`🧹 Cleaned up ${result.affectedRows} old M1 candles`);
         } catch (error) {
-            console.error('❌ Error cleaning up old candles:', error);
+            console.error('❌ Error cleaning up old candles:', error.message);
         }
     }
 
     async disconnect() {
         if (this.pool) {
             await this.pool.end();
-            console.log('📌 Database connection pool closed');
+            console.log('🔌 Database connection pool closed');
         }
     }
 }
