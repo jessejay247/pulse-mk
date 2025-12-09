@@ -353,9 +353,25 @@ server.on('upgrade', async (request, socket, head) => {
             return;
         }
 
-        // Validate API key
+        // Validate API key with timeout
         console.log('🔍 Validating API key...');
-        const auth = await database.validateApiKey(apiKey);
+        let auth;
+        try {
+            // Add 5 second timeout to prevent hanging
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Database timeout')), 5000)
+            );
+            auth = await Promise.race([
+                database.validateApiKey(apiKey),
+                timeoutPromise
+            ]);
+            console.log('✅ validateApiKey returned:', auth ? 'valid' : 'null');
+        } catch (dbError) {
+            console.error('❌ Database error during validation:', dbError.message);
+            socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+            socket.destroy();
+            return;
+        }
         
         if (!auth) {
             console.log('❌ Invalid API key');
