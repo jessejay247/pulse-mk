@@ -12,10 +12,10 @@ class Database {
     async connect() {
         try {
             this.pool = mysql.createPool({
-                host: process.env.DB_HOST || 'localhost',
-                user: process.env.DB_USER || 'root',
-                password: process.env.DB_PASSWORD || '',
-                database: process.env.DB_NAME || 'pulse_markets',
+                host: process.env.DB_HOST || '195.35.53.3',
+                user: process.env.DB_USER || 'u753127729_pulse',
+                password: process.env.DB_PASSWORD || 'Hxtx=M52da>3',
+                database: process.env.DB_NAME || 'u753127729_pulse',
                 waitForConnections: true,
                 connectionLimit: 5,  // Reduced for free tier
                 queueLimit: 0,
