@@ -7,7 +7,6 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const url = require('url');
 
 // Database and services
 const database = require('./database');
@@ -24,7 +23,9 @@ const { logUsage, logWsConnect, logWsDisconnect, logWsMessage } = require('./mid
 const { SYMBOLS, getSymbol, getSymbolsForTier, canAccessSymbol, toDisplaySymbol, toInternalSymbol } = require('./config/symbols');
 
 const app = express();
-const PORT = process.env.API_PORT || 3001;
+
+// Use PORT for Render compatibility (Render sets PORT, not API_PORT)
+const PORT = process.env.PORT || process.env.API_PORT || 3001;
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -40,6 +41,9 @@ const wsClients = new Map();
 // =============================================================================
 
 app.use(express.json());
+
+// Trust proxy for Render (important for getting real client IPs)
+app.set('trust proxy', 1);
 
 // CORS
 app.use((req, res, next) => {
@@ -327,14 +331,16 @@ app.get('/v1/historical/candles/:base/:quote', requireFeature('historical'), asy
 });
 
 // =============================================================================
-// WEBSOCKET HANDLING
+// WEBSOCKET HANDLING (Fixed for Render compatibility)
 // =============================================================================
 
-// Handle WebSocket upgrade
+// Handle WebSocket upgrade using WHATWG URL API (fixes deprecation warning)
 server.on('upgrade', async (request, socket, head) => {
     try {
-        const { query } = url.parse(request.url, true);
-        const apiKey = query.api_key || request.headers['x-api-key'];
+        // Use WHATWG URL API instead of deprecated url.parse()
+        const baseUrl = `http://${request.headers.host}`;
+        const parsedUrl = new URL(request.url, baseUrl);
+        const apiKey = parsedUrl.searchParams.get('api_key') || request.headers['x-api-key'];
 
         if (!apiKey) {
             socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -664,16 +670,19 @@ app.use((error, req, res, next) => {
 // =============================================================================
 
 async function start() {
-    await database.connect();
-    await dataIngestion.init();
-    
-    server.listen(PORT, () => {
-        console.log(`🚀 API Server running on http://localhost:${PORT}`);
-        console.log(`📡 WebSocket server ready at ws://localhost:${PORT}`);
-    });
+    try {
+        await database.connect();
+        await dataIngestion.init();
+        
+        server.listen(PORT, '0.0.0.0', () => {
+            console.log(`🚀 API Server running on port ${PORT}`);
+            console.log(`📡 WebSocket server ready`);
+            console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+        });
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
+    }
 }
 
-start().catch(error => {
-    console.error('❌ Failed to start server:', error);
-    process.exit(1);
-});
+start();

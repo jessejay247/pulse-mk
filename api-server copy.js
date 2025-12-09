@@ -112,3 +112,8 @@
 //  node scripts/seed-historical.js EURUSD GBPUSD --months 1 --timeframe H4
 //  node scripts/seed-historical.js EURUSD GBPUSD --months 1 --timeframe H4
 //  node scripts/seed-historical.js EURUSD GBPUSD --months 1 --timeframe M1
+
+
+
+
+// node scripts/seed-historical.js EURGBP EURJPY GBPJPY BTCUSD --months 1 --timeframe D1
