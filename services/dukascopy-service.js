@@ -1,58 +1,32 @@
 // =============================================================================
-// services/dukascopy-service.js - Dukascopy Historical Data Service
+// services/dukascopy-service.js - Dukascopy Historical Data Service (FIXED)
+// =============================================================================
+// 
+// Changes:
+// - Uses ON DUPLICATE KEY UPDATE instead of INSERT IGNORE
+// - Updates incomplete candles with correct OHLC values
 // =============================================================================
 
 const { getHistoricalRates } = require('dukascopy-node');
 const database = require('../database');
 
-// Dukascopy instrument mappings
 const DUKASCOPY_INSTRUMENTS = {
-    // Major Forex Pairs
-    'EURUSD': 'eurusd',
-    'GBPUSD': 'gbpusd',
-    'USDJPY': 'usdjpy',
-    'USDCHF': 'usdchf',
-    'AUDUSD': 'audusd',
-    'USDCAD': 'usdcad',
-    'NZDUSD': 'nzdusd',
-    
-    // Minor/Cross Pairs
-    'EURGBP': 'eurgbp',
-    'EURJPY': 'eurjpy',
-    'GBPJPY': 'gbpjpy',
-    'EURCHF': 'eurchf',
-    'GBPCHF': 'gbpchf',
-    'AUDJPY': 'audjpy',
-    'EURAUD': 'euraud',
-    'EURCAD': 'eurcad',
-    'GBPAUD': 'gbpaud',
-    'GBPCAD': 'gbpcad',
-    'AUDCAD': 'audcad',
-    'AUDNZD': 'audnzd',
-    'NZDJPY': 'nzdjpy',
-    'CADJPY': 'cadjpy',
-    'CHFJPY': 'chfjpy',
-    'EURNZD': 'eurnzd',
-    
-    // Metals
-    'XAUUSD': 'xauusd',
-    'XAGUSD': 'xagusd'
+    'EURUSD': 'eurusd', 'GBPUSD': 'gbpusd', 'USDJPY': 'usdjpy',
+    'USDCHF': 'usdchf', 'AUDUSD': 'audusd', 'USDCAD': 'usdcad',
+    'NZDUSD': 'nzdusd', 'EURGBP': 'eurgbp', 'EURJPY': 'eurjpy',
+    'GBPJPY': 'gbpjpy', 'EURCHF': 'eurchf', 'GBPCHF': 'gbpchf',
+    'AUDJPY': 'audjpy', 'EURAUD': 'euraud', 'EURCAD': 'eurcad',
+    'GBPAUD': 'gbpaud', 'GBPCAD': 'gbpcad', 'AUDCAD': 'audcad',
+    'AUDNZD': 'audnzd', 'NZDJPY': 'nzdjpy', 'CADJPY': 'cadjpy',
+    'CHFJPY': 'chfjpy', 'EURNZD': 'eurnzd',
+    'XAUUSD': 'xauusd', 'XAGUSD': 'xagusd'
 };
 
-// Timeframe mappings
 const TIMEFRAME_MAP = {
-    'M1': 'm1',
-    'M5': 'm5',
-    'M15': 'm15',
-    'M30': 'm30',
-    'H1': 'h1',
-    'H4': 'h4',
-    'D1': 'd1',
-    'W1': 'w1',
-    'MN': 'mn1'
+    'M1': 'm1', 'M5': 'm5', 'M15': 'm15', 'M30': 'm30',
+    'H1': 'h1', 'H4': 'h4', 'D1': 'd1', 'W1': 'w1', 'MN': 'mn1'
 };
 
-// Timeframe durations in milliseconds
 const TIMEFRAME_MS = {
     'M1': 60 * 1000,
     'M5': 5 * 60 * 1000,
@@ -67,37 +41,23 @@ const TIMEFRAME_MS = {
 class DukascopyService {
     constructor() {
         this.isRunning = false;
-        this.stats = {
-            fetched: 0,
-            inserted: 0,
-            errors: 0
-        };
+        this.stats = { fetched: 0, inserted: 0, updated: 0, errors: 0 };
     }
 
-    /**
-     * Fetch historical data from Dukascopy
-     */
     async fetchCandles(symbol, timeframe, fromDate, toDate) {
         const instrument = DUKASCOPY_INSTRUMENTS[symbol];
         const tf = TIMEFRAME_MAP[timeframe];
 
-        if (!instrument) {
-            throw new Error(`Unknown symbol: ${symbol}`);
-        }
-        if (!tf) {
-            throw new Error(`Unknown timeframe: ${timeframe}`);
-        }
+        if (!instrument) throw new Error(`Unknown symbol: ${symbol}`);
+        if (!tf) throw new Error(`Unknown timeframe: ${timeframe}`);
 
         try {
             const data = await getHistoricalRates({
-                instrument: instrument,
-                dates: {
-                    from: fromDate,
-                    to: toDate
-                },
+                instrument,
+                dates: { from: fromDate, to: toDate },
                 timeframe: tf,
                 format: 'json',
-                priceType: 'bid', // Use bid prices
+                priceType: 'bid',
                 volumes: true
             });
 
@@ -120,12 +80,14 @@ class DukascopyService {
     }
 
     /**
-     * Save candles to database in batches
+     * Save candles - UPDATED to use ON DUPLICATE KEY UPDATE
+     * This ensures incomplete candles get corrected with proper OHLC data
      */
     async saveCandles(candles, batchSize = 500) {
         if (!candles || candles.length === 0) return 0;
 
         let inserted = 0;
+        let updated = 0;
 
         for (let i = 0; i < candles.length; i += batchSize) {
             const batch = candles.slice(i, i + batchSize);
@@ -133,41 +95,49 @@ class DukascopyService {
             try {
                 const placeholders = batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
                 const values = batch.flatMap(c => [
-                    c.symbol,
-                    c.timeframe,
-                    c.timestamp,
-                    c.open,
-                    c.high,
-                    c.low,
-                    c.close,
-                    c.volume,
-                    0 // spread
+                    c.symbol, c.timeframe, c.timestamp,
+                    c.open, c.high, c.low, c.close, c.volume, 0
                 ]);
 
-                await database.pool.execute(`
-                    INSERT IGNORE INTO pulse_market_data 
+                // ✅ FIX: Use ON DUPLICATE KEY UPDATE to fix incomplete candles
+                // This replaces the old OHLC values with correct historical data
+                const [result] = await database.pool.execute(`
+                    INSERT INTO pulse_market_data 
                     (symbol, timeframe, timestamp, open, high, low, close, volume, spread)
                     VALUES ${placeholders}
+                    ON DUPLICATE KEY UPDATE
+                        open = VALUES(open),
+                        high = VALUES(high),
+                        low = VALUES(low),
+                        close = VALUES(close),
+                        volume = VALUES(volume)
                 `, values);
 
-                inserted += batch.length;
+                // affectedRows: 1 = inserted, 2 = updated existing row
+                inserted += result.affectedRows;
             } catch (error) {
                 console.error('❌ Batch insert error:', error.message);
-                // Try individual inserts
+                // Individual fallback
                 for (const candle of batch) {
                     try {
-                        await database.pool.execute(`
-                            INSERT IGNORE INTO pulse_market_data 
+                        const [result] = await database.pool.execute(`
+                            INSERT INTO pulse_market_data 
                             (symbol, timeframe, timestamp, open, high, low, close, volume, spread)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON DUPLICATE KEY UPDATE
+                                open = VALUES(open),
+                                high = VALUES(high),
+                                low = VALUES(low),
+                                close = VALUES(close),
+                                volume = VALUES(volume)
                         `, [
                             candle.symbol, candle.timeframe, candle.timestamp,
                             candle.open, candle.high, candle.low, candle.close,
                             candle.volume, 0
                         ]);
-                        inserted++;
+                        inserted += result.affectedRows;
                     } catch (e) {
-                        // Skip duplicates
+                        // Skip errors
                     }
                 }
             }
@@ -178,18 +148,20 @@ class DukascopyService {
     }
 
     /**
-     * Fetch and save data for a symbol/timeframe combination
+     * Fetch and save - now with option to force update existing
      */
-    async fetchAndSave(symbol, timeframe, fromDate, toDate) {
+    async fetchAndSave(symbol, timeframe, fromDate, toDate, options = {}) {
+        const { forceUpdate = true } = options; // Default to updating existing
+
         console.log(`📥 Fetching ${symbol} ${timeframe} from ${fromDate.toISOString().split('T')[0]} to ${toDate.toISOString().split('T')[0]}`);
         
         try {
             const candles = await this.fetchCandles(symbol, timeframe, fromDate, toDate);
             
             if (candles.length > 0) {
-                const inserted = await this.saveCandles(candles);
-                console.log(`   ✅ Fetched ${candles.length} candles, inserted ${inserted}`);
-                return inserted;
+                const result = await this.saveCandles(candles);
+                console.log(`   ✅ Fetched ${candles.length} candles, processed ${result} rows`);
+                return result;
             } else {
                 console.log(`   ⚠️  No data returned`);
                 return 0;
@@ -200,9 +172,6 @@ class DukascopyService {
         }
     }
 
-    /**
-     * Get the latest candle timestamp for a symbol/timeframe
-     */
     async getLatestTimestamp(symbol, timeframe) {
         try {
             const [rows] = await database.pool.execute(`
@@ -210,17 +179,12 @@ class DukascopyService {
                 FROM pulse_market_data
                 WHERE symbol = ? AND timeframe = ?
             `, [symbol, timeframe]);
-
             return rows[0]?.latest || null;
         } catch (error) {
-            console.error('Error getting latest timestamp:', error);
             return null;
         }
     }
 
-    /**
-     * Get the oldest candle timestamp for a symbol/timeframe
-     */
     async getOldestTimestamp(symbol, timeframe) {
         try {
             const [rows] = await database.pool.execute(`
@@ -228,10 +192,8 @@ class DukascopyService {
                 FROM pulse_market_data
                 WHERE symbol = ? AND timeframe = ?
             `, [symbol, timeframe]);
-
             return rows[0]?.oldest || null;
         } catch (error) {
-            console.error('Error getting oldest timestamp:', error);
             return null;
         }
     }
@@ -242,7 +204,6 @@ class DukascopyService {
     async detectGaps(symbol, timeframe, fromDate, toDate) {
         const gaps = [];
         const tfMs = TIMEFRAME_MS[timeframe];
-        
         if (!tfMs) return gaps;
 
         try {
@@ -261,14 +222,10 @@ class DukascopyService {
                 const curr = new Date(rows[i].timestamp).getTime();
                 const expectedNext = prev + tfMs;
 
-                // Allow some tolerance (market closed hours)
-                // For forex, skip weekends
                 if (curr - expectedNext > tfMs * 2) {
-                    // Check if this gap spans a weekend
                     const gapStart = new Date(expectedNext);
                     const gapEnd = new Date(curr);
                     
-                    // Skip weekend gaps for forex
                     if (!this.isWeekendGap(gapStart, gapEnd)) {
                         gaps.push({
                             from: gapStart,
@@ -286,16 +243,35 @@ class DukascopyService {
     }
 
     /**
-     * Check if a gap is just a weekend
+     * Detect incomplete/suspicious candles (same OHLC values)
      */
+    async detectIncompleteCandles(symbol, timeframe, fromDate, toDate) {
+        try {
+            const [rows] = await database.pool.execute(`
+                SELECT id, timestamp, open, high, low, close
+                FROM pulse_market_data
+                WHERE symbol = ? AND timeframe = ?
+                AND timestamp BETWEEN ? AND ?
+                AND open = high AND high = low AND low = close
+            `, [symbol, timeframe, fromDate, toDate]);
+
+            return rows.map(r => ({
+                id: r.id,
+                timestamp: r.timestamp,
+                price: r.close
+            }));
+        } catch (error) {
+            console.error('Error detecting incomplete candles:', error);
+            return [];
+        }
+    }
+
     isWeekendGap(from, to) {
         const fromDay = from.getUTCDay();
         const toDay = to.getUTCDay();
         const diffDays = (to - from) / (24 * 60 * 60 * 1000);
 
-        // If gap is less than 3 days and spans Sat/Sun, it's a weekend
         if (diffDays <= 3) {
-            // Friday 22:00 to Sunday 21:00 is normal weekend gap
             if (fromDay === 5 || fromDay === 6 || toDay === 0 || toDay === 1) {
                 return true;
             }
@@ -303,40 +279,11 @@ class DukascopyService {
         return false;
     }
 
-    /**
-     * Get available symbols
-     */
-    getSymbols() {
-        return Object.keys(DUKASCOPY_INSTRUMENTS);
-    }
-
-    /**
-     * Get forex symbols only (no metals)
-     */
-    getForexSymbols() {
-        return Object.keys(DUKASCOPY_INSTRUMENTS).filter(s => !s.startsWith('XA'));
-    }
-
-    /**
-     * Get metal symbols only
-     */
-    getMetalSymbols() {
-        return Object.keys(DUKASCOPY_INSTRUMENTS).filter(s => s.startsWith('XA'));
-    }
-
-    /**
-     * Reset stats
-     */
-    resetStats() {
-        this.stats = { fetched: 0, inserted: 0, errors: 0 };
-    }
-
-    /**
-     * Get stats
-     */
-    getStats() {
-        return { ...this.stats };
-    }
+    getSymbols() { return Object.keys(DUKASCOPY_INSTRUMENTS); }
+    getForexSymbols() { return Object.keys(DUKASCOPY_INSTRUMENTS).filter(s => !s.startsWith('XA')); }
+    getMetalSymbols() { return Object.keys(DUKASCOPY_INSTRUMENTS).filter(s => s.startsWith('XA')); }
+    resetStats() { this.stats = { fetched: 0, inserted: 0, updated: 0, errors: 0 }; }
+    getStats() { return { ...this.stats }; }
 }
 
 module.exports = new DukascopyService();

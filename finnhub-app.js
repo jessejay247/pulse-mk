@@ -1,5 +1,5 @@
 // =============================================================================
-// finnhub-app.js - Data Ingestion Service with Market Hours (Memory Optimized)
+// finnhub-app.js - Data Ingestion Service with Spike Filter
 // =============================================================================
 
 require('dotenv').config();
@@ -8,9 +8,8 @@ const WebSocket = require('ws');
 const cron = require('node-cron');
 const database = require('./database');
 const { SYMBOLS, getSymbolByFinnhub, toInternalSymbol } = require('./config/symbols');
-const { isMarketOpenForSymbol } = require('./config/market-hours');
+const { isMarketOpenForSymbol, isForexMarketOpen } = require('./config/market-hours');
 
-// Skip gap recovery on free tier to save memory - can be enabled on paid plans
 const ENABLE_GAP_RECOVERY = process.env.ENABLE_GAP_RECOVERY === 'true';
 
 class FinnhubDataIngestion {
@@ -22,86 +21,194 @@ class FinnhubDataIngestion {
         this.maxReconnectAttempts = 10;
         this.tickCallbacks = [];
         this.isConnected = false;
-        
-        // Memory management
-        this.maxBufferSize = 500; // Limit buffer entries
+        this.maxBufferSize = 500;
         this.lastCleanup = Date.now();
+        
+        // 🎯 NEW: Price tracking for spike detection
+        this.lastPrices = new Map();
+        this.priceHistory = new Map(); // Rolling window for volatility calc
+        
+        // Spike filter thresholds (percentage)
+        this.spikeThresholds = {
+            forex: 0.5,    // 0.5% max tick-to-tick change for forex
+            metal: 1.0,    // 1% for metals (more volatile)
+            crypto: 3.0,   // 3% for crypto (very volatile)
+            stock: 5.0     // 5% for stocks (gaps common)
+        };
     }
 
     async init() {
         await database.connect();
         
-        // Only run gap recovery if explicitly enabled (uses lots of memory)
+        // Load last known prices from DB to avoid false spikes on startup
+        await this.loadLastPrices();
+        
         if (ENABLE_GAP_RECOVERY) {
             try {
                 const gapRecovery = require('./services/gap-recovery');
                 await gapRecovery.recoverOnStartup();
-                gapRecovery.startPeriodicCheck(120); // Less frequent on free tier
+                gapRecovery.startPeriodicCheck(120);
             } catch (error) {
                 console.log('⚠️ Gap recovery disabled or failed:', error.message);
             }
-        } else {
-            console.log('ℹ️ Gap recovery disabled for memory optimization');
         }
         
         await this.initWebSocket();
         this.startCleanupJob();
         this.startBufferFlushJob();
-        
-        // Periodic memory cleanup
         this.startMemoryCleanup();
         
-        console.log('🚀 Finnhub Data Ingestion Started!');
+        console.log('🚀 Finnhub Data Ingestion Started (with spike filter)');
         console.log(`📈 Tracking ${Object.keys(SYMBOLS).length} symbols`);
         this.logMemoryUsage();
     }
 
+    // 🎯 NEW: Load last prices from database on startup
+    async loadLastPrices() {
+        try {
+            const [rows] = await database.pool.execute(`
+                SELECT symbol, close, timestamp 
+                FROM pulse_market_data 
+                WHERE timeframe = 'M1'
+                AND timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                ORDER BY timestamp DESC
+            `);
+            
+            const seen = new Set();
+            for (const row of rows) {
+                if (!seen.has(row.symbol)) {
+                    this.lastPrices.set(row.symbol, {
+                        price: parseFloat(row.close),
+                        timestamp: new Date(row.timestamp)
+                    });
+                    seen.add(row.symbol);
+                }
+            }
+            
+            console.log(`📊 Loaded ${this.lastPrices.size} last prices from DB`);
+        } catch (error) {
+            console.error('⚠️ Could not load last prices:', error.message);
+        }
+    }
+
+    // 🎯 NEW: Spike detection
+    isSpike(symbol, symbolType, newPrice) {
+        const lastData = this.lastPrices.get(symbol);
+        
+        // No last price = can't detect spike, accept it
+        if (!lastData) {
+            return { isSpike: false, reason: 'no_history' };
+        }
+        
+        const lastPrice = lastData.price;
+        const timeDiff = Date.now() - lastData.timestamp.getTime();
+        
+        // If last price is very old (>5 min), be more lenient
+        const isStale = timeDiff > 5 * 60 * 1000;
+        
+        const changePercent = Math.abs((newPrice - lastPrice) / lastPrice) * 100;
+        let threshold = this.spikeThresholds[symbolType] || 1.0;
+        
+        // Double threshold for stale data
+        if (isStale) {
+            threshold *= 2;
+        }
+        
+        if (changePercent > threshold) {
+            return {
+                isSpike: true,
+                reason: `${changePercent.toFixed(3)}% change exceeds ${threshold}% threshold`,
+                lastPrice,
+                newPrice,
+                changePercent
+            };
+        }
+        
+        return { isSpike: false, changePercent };
+    }
+
+    // 🎯 NEW: Update price tracking
+    updatePriceTracking(symbol, price) {
+        this.lastPrices.set(symbol, {
+            price,
+            timestamp: new Date()
+        });
+        
+        // Keep rolling history (last 20 prices) for volatility calculation
+        if (!this.priceHistory.has(symbol)) {
+            this.priceHistory.set(symbol, []);
+        }
+        const history = this.priceHistory.get(symbol);
+        history.push(price);
+        if (history.length > 20) {
+            history.shift();
+        }
+    }
+
     logMemoryUsage() {
         const used = process.memoryUsage();
-        console.log(`📊 Memory: RSS=${Math.round(used.rss / 1024 / 1024)}MB, Heap=${Math.round(used.heapUsed / 1024 / 1024)}MB/${Math.round(used.heapTotal / 1024 / 1024)}MB`);
+        console.log(`📊 Memory: RSS=${Math.round(used.rss / 1024 / 1024)}MB, Heap=${Math.round(used.heapUsed / 1024 / 1024)}MB`);
     }
 
     startMemoryCleanup() {
-        // Run garbage collection hints and cleanup every 5 minutes
         setInterval(() => {
             this.cleanupBuffers();
             this.logMemoryUsage();
-            
-            // Force GC if available (run node with --expose-gc)
-            if (global.gc) {
-                global.gc();
-            }
+            if (global.gc) global.gc();
         }, 5 * 60 * 1000);
+    }
+
+    getSymbolType(internalSymbol) {
+        for (const [symbol, config] of Object.entries(SYMBOLS)) {
+            if (symbol.replace('/', '') === internalSymbol) {
+                return config.type;
+            }
+        }
+        return 'forex';
+    }
+
+    shouldSaveCandle(candle) {
+        const symbolType = this.getSymbolType(candle.symbol);
+        const marketStatus = isMarketOpenForSymbol(symbolType, candle.timestamp);
+        return marketStatus.open;
     }
 
     cleanupBuffers() {
         const now = Date.now();
-        const maxAge = 5 * 60 * 1000; // 5 minutes
+        const maxAge = 5 * 60 * 1000;
         let cleaned = 0;
+        let skippedClosed = 0;
         
         for (const [key, candle] of this.candleBuffers.entries()) {
             if (now - candle.lastUpdate > maxAge) {
-                this.saveCandleToDatabase(candle);
+                if (this.shouldSaveCandle(candle)) {
+                    this.saveCandleToDatabase(candle);
+                } else {
+                    skippedClosed++;
+                }
                 this.candleBuffers.delete(key);
                 cleaned++;
             }
         }
         
-        // If still too many buffers, force cleanup oldest ones
         if (this.candleBuffers.size > this.maxBufferSize) {
             const entries = Array.from(this.candleBuffers.entries())
                 .sort((a, b) => a[1].lastUpdate - b[1].lastUpdate);
             
             const toRemove = entries.slice(0, entries.length - this.maxBufferSize);
             for (const [key, candle] of toRemove) {
-                this.saveCandleToDatabase(candle);
+                if (this.shouldSaveCandle(candle)) {
+                    this.saveCandleToDatabase(candle);
+                } else {
+                    skippedClosed++;
+                }
                 this.candleBuffers.delete(key);
                 cleaned++;
             }
         }
         
         if (cleaned > 0) {
-            console.log(`🧹 Cleaned ${cleaned} stale buffers, ${this.candleBuffers.size} remaining`);
+            console.log(`🧹 Cleaned ${cleaned} buffers, ${skippedClosed} skipped`);
         }
     }
 
@@ -117,7 +224,6 @@ class FinnhubDataIngestion {
             this.isConnected = true;
             this.reconnectAttempts = 0;
             
-            // Subscribe to all symbols
             for (const [symbol, config] of Object.entries(SYMBOLS)) {
                 this.ws.send(JSON.stringify({
                     type: 'subscribe',
@@ -132,7 +238,6 @@ class FinnhubDataIngestion {
                 const message = JSON.parse(data);
                 
                 if (message.type === 'trade' && message.data) {
-                    // Process only first few trades per batch to reduce memory pressure
                     const trades = message.data.slice(0, 5);
                     trades.forEach(trade => this.processTrade(trade));
                 } else if (message.type === 'ping') {
@@ -154,7 +259,6 @@ class FinnhubDataIngestion {
             this.scheduleReconnect();
         });
 
-        // Heartbeat
         this.heartbeatInterval = setInterval(() => {
             if (this.ws?.readyState === WebSocket.OPEN) {
                 this.ws.send(JSON.stringify({ type: 'ping' }));
@@ -178,46 +282,46 @@ class FinnhubDataIngestion {
     processTrade(trade) {
         const { p: price, s: finnhubSymbol, t: timestamp, v: volume } = trade;
         
-        // Get our symbol config
         const symbolInfo = getSymbolByFinnhub(finnhubSymbol);
-        if (!symbolInfo) {
-            return;
-        }
+        if (!symbolInfo) return;
 
         const { symbol, type } = symbolInfo;
         const internalSymbol = toInternalSymbol(symbol);
         const tradeTime = new Date(timestamp);
 
-        // Market hours check
-        const marketStatus = isMarketOpenForSymbol(type, tradeTime);
-        if (!marketStatus.open) {
-            this.emitTick({
-                symbol: internalSymbol,
-                displaySymbol: symbol,
-                price,
-                volume,
-                timestamp: tradeTime,
-                marketClosed: true,
-                reason: marketStatus.reason
-            });
-            return;
+        // 🎯 SPIKE DETECTION - Check before processing
+        const spikeCheck = this.isSpike(internalSymbol, type, price);
+        
+        if (spikeCheck.isSpike) {
+            console.warn(`⚠️ SPIKE REJECTED: ${internalSymbol} ${spikeCheck.lastPrice?.toFixed(5)} → ${price.toFixed(5)} (${spikeCheck.reason})`);
+            return; // Don't process this tick
         }
 
-        // Emit tick for real-time consumers
+        // Update price tracking (only for valid prices)
+        this.updatePriceTracking(internalSymbol, price);
+
+        // Market hours check
+        const marketStatus = isMarketOpenForSymbol(type, tradeTime);
+        
+        // Always emit tick for real-time display
         this.emitTick({
             symbol: internalSymbol,
             displaySymbol: symbol,
             price,
             volume,
             timestamp: tradeTime,
-            marketClosed: false
+            marketClosed: !marketStatus.open,
+            reason: marketStatus.reason
         });
 
-        // Only update essential timeframes to save memory
-        // Reduced from 7 timeframes to 4 for free tier
+        // Don't create candles if market is closed
+        if (!marketStatus.open) {
+            return;
+        }
+
         const timeframes = process.env.NODE_ENV === 'production' 
-            ? ['M1', 'M5', 'H1', 'D1']  // Production: fewer timeframes
-            : ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1']; // Dev: all timeframes
+            ? ['M1', 'M5', 'H1', 'D1']
+            : ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
             
         timeframes.forEach(timeframe => {
             this.updateCandle(internalSymbol, timeframe, tradeTime, price, volume || 0);
@@ -225,7 +329,6 @@ class FinnhubDataIngestion {
     }
 
     emitTick(tick) {
-        // Limit number of callbacks to prevent memory leaks
         const callbacks = this.tickCallbacks.slice(0, 10);
         callbacks.forEach(callback => {
             try {
@@ -237,7 +340,6 @@ class FinnhubDataIngestion {
     }
 
     onTick(callback) {
-        // Limit total callbacks
         if (this.tickCallbacks.length < 10) {
             this.tickCallbacks.push(callback);
         }
@@ -246,27 +348,28 @@ class FinnhubDataIngestion {
     getCandleStartTime(timestamp, timeframe) {
         const time = new Date(timestamp);
         
+        // 🎯 FIX: Use UTC methods for consistency
         switch (timeframe) {
             case 'M1':
-                time.setSeconds(0, 0);
+                time.setUTCSeconds(0, 0);
                 break;
             case 'M5':
-                time.setMinutes(Math.floor(time.getMinutes() / 5) * 5, 0, 0);
+                time.setUTCMinutes(Math.floor(time.getUTCMinutes() / 5) * 5, 0, 0);
                 break;
             case 'M15':
-                time.setMinutes(Math.floor(time.getMinutes() / 15) * 15, 0, 0);
+                time.setUTCMinutes(Math.floor(time.getUTCMinutes() / 15) * 15, 0, 0);
                 break;
             case 'M30':
-                time.setMinutes(Math.floor(time.getMinutes() / 30) * 30, 0, 0);
+                time.setUTCMinutes(Math.floor(time.getUTCMinutes() / 30) * 30, 0, 0);
                 break;
             case 'H1':
-                time.setMinutes(0, 0, 0);
+                time.setUTCMinutes(0, 0, 0);
                 break;
             case 'H4':
-                time.setHours(Math.floor(time.getHours() / 4) * 4, 0, 0, 0);
+                time.setUTCHours(Math.floor(time.getUTCHours() / 4) * 4, 0, 0, 0);
                 break;
             case 'D1':
-                time.setHours(0, 0, 0, 0);
+                time.setUTCHours(0, 0, 0, 0);
                 break;
         }
         
@@ -278,7 +381,6 @@ class FinnhubDataIngestion {
         const bufferKey = `${symbol}_${timeframe}_${candleStart.getTime()}`;
 
         if (!this.candleBuffers.has(bufferKey)) {
-            // Check buffer size before adding
             if (this.candleBuffers.size >= this.maxBufferSize) {
                 this.cleanupBuffers();
             }
@@ -305,10 +407,11 @@ class FinnhubDataIngestion {
             candle.lastUpdate = Date.now();
         }
 
-        // Save more frequently to keep buffer small
         const candle = this.candleBuffers.get(bufferKey);
         if (candle.tradeCount >= 5 || (Date.now() - candle.lastUpdate) > 15000) {
-            this.saveCandleToDatabase(candle);
+            if (this.shouldSaveCandle(candle)) {
+                this.saveCandleToDatabase(candle);
+            }
         }
     }
 
@@ -339,7 +442,6 @@ class FinnhubDataIngestion {
     }
 
     startCleanupJob() {
-        // Cleanup old candles every hour
         cron.schedule('0 * * * *', async () => {
             await database.cleanupOldCandles();
             this.logMemoryUsage();
@@ -347,67 +449,67 @@ class FinnhubDataIngestion {
     }
 
     startBufferFlushJob() {
-        // Flush stale buffers every 30 seconds (more frequent for memory management)
         cron.schedule('*/30 * * * * *', () => {
             const now = Date.now();
             let flushed = 0;
+            let skippedClosed = 0;
             
             for (const [key, candle] of this.candleBuffers.entries()) {
                 if (now - candle.lastUpdate > 30000) {
-                    this.saveCandleToDatabase(candle);
+                    if (this.shouldSaveCandle(candle)) {
+                        this.saveCandleToDatabase(candle);
+                        flushed++;
+                    } else {
+                        skippedClosed++;
+                    }
                     this.candleBuffers.delete(key);
-                    flushed++;
                 }
             }
             
-            if (flushed > 0) {
-                console.log(`💾 Flushed ${flushed} candles to DB`);
+            if (flushed > 0 || skippedClosed > 0) {
+                console.log(`💾 Flushed ${flushed} candles, ${skippedClosed} skipped`);
             }
         });
     }
 
     getStatus() {
+        const forexStatus = isForexMarketOpen();
         return {
             connected: this.isConnected,
             symbolCount: Object.keys(SYMBOLS).length,
             bufferSize: this.candleBuffers.size,
-            reconnectAttempts: this.reconnectAttempts
+            trackedPrices: this.lastPrices.size,
+            reconnectAttempts: this.reconnectAttempts,
+            forexMarketOpen: forexStatus.open,
+            marketSession: forexStatus.session || forexStatus.reason
         };
     }
 
     async shutdown() {
         console.log('🛑 Shutting down data ingestion...');
         
-        // Save all buffered candles
         for (const candle of this.candleBuffers.values()) {
-            await this.saveCandleToDatabase(candle);
+            if (this.shouldSaveCandle(candle)) {
+                await this.saveCandleToDatabase(candle);
+            }
         }
         this.candleBuffers.clear();
         
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-        }
-        
-        if (this.ws) {
-            this.ws.close();
-        }
+        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+        if (this.ws) this.ws.close();
         
         await database.disconnect();
         console.log('✅ Shutdown complete');
     }
 }
 
-// Create singleton instance
 const dataIngestion = new FinnhubDataIngestion();
 
-// Handle graceful shutdown
 process.on('SIGTERM', () => dataIngestion.shutdown());
 process.on('SIGINT', () => dataIngestion.shutdown());
 
-// Export for use by API server
 module.exports = dataIngestion;
 
-// Start if run directly
 if (require.main === module) {
     dataIngestion.init().catch(error => {
         console.error('❌ Failed to start:', error);

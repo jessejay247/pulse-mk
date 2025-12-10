@@ -1,21 +1,41 @@
 {
   "name": "pulse_market_server",
-  "version": "2.0.0",
-  "description": "PulseMarkets API Server - Real-time forex, crypto, and stock data",
-  "main": "api-server.js",
+  "version": "3.0.0",
+  "description": "PulseMarkets Self-Healing Forex Data Engine",
+  "main": "api-server-v2.js",
   "scripts": {
-    "start": "node api-server.js",
-    "start:ingestion": "node finnhub-app.js",
-    "start:data-manager": "node scripts/data-manager.js",
-    "dev": "nodemon api-server.js",
-    "dev:ingestion": "nodemon finnhub-app.js",
+    "start": "node api-server-v2.js",
+    "start:engine": "node self-healing-engine.js",
+    "dev": "nodemon api-server-v2.js",
+    
+    "ops": "node scripts/manual-operations.js",
+    "ops:health": "node scripts/manual-operations.js health",
+    "ops:gaps": "node scripts/manual-operations.js gaps --primary",
+    "ops:gaps:fix": "node scripts/manual-operations.js gaps --primary --fix",
+    
+    "backfill": "node scripts/manual-operations.js backfill",
+    "backfill:eurusd": "node scripts/manual-operations.js backfill EURUSD --days 7",
+    "backfill:primary": "node scripts/manual-operations.js backfill EURUSD GBPUSD USDJPY XAUUSD --days 7",
+    
+    "verify": "node scripts/manual-operations.js verify",
+    "verify:all": "node scripts/manual-operations.js verify EURUSD M1 --days 7",
+    
+    "fix": "node scripts/manual-operations.js fix-incomplete",
+    "rebuild": "node scripts/manual-operations.js rebuild",
+    
     "seed": "node scripts/seed-historical.js",
-    "seed:majors": "node scripts/seed-historical.js EURUSD GBPUSD USDJPY USDCHF AUDUSD USDCAD NZDUSD",
-    "seed:metals": "node scripts/seed-historical.js XAUUSD XAGUSD",
-    "seed:quick": "node scripts/seed-historical.js EURUSD GBPUSD XAUUSD --years 1",
-    "import": "node import-historical.js",
-    "import-batch": "node batch-import.js",
-    "backfill": "node scripts/backfill-gaps.js",
+    "seed:majors": "node scripts/seed-historical.js EURUSD GBPUSD USDJPY USDCHF AUDUSD USDCAD NZDUSD --months 1",
+    "seed:metals": "node scripts/seed-historical.js XAUUSD XAGUSD --months 1",
+    "seed:primary": "node scripts/seed-historical.js EURUSD GBPUSD USDJPY XAUUSD USDCHF AUDUSD USDCAD NZDUSD EURGBP EURJPY GBPJPY --months 1",
+    "seed:force": "node scripts/seed-historical.js --force --months 1",
+    
+    "cleanup": "node scripts/cleanup-closed-market.js",
+    "cleanup:execute": "node scripts/cleanup-closed-market.js --execute",
+    
+    "legacy:start": "node api-server.js",
+    "legacy:ingestion": "node finnhub-app.js",
+    "legacy:data-manager": "node scripts/data-manager.js",
+    
     "test": "echo \"No tests yet\" && exit 0"
   },
   "dependencies": {

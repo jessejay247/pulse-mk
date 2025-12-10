@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 // =============================================================================
-// scripts/seed-historical.js - Seed Historical Data from Dukascopy
+// scripts/seed-historical.js - Seed Historical Data from Dukascopy (FIXED)
+// =============================================================================
+//
+// Changes:
+// - Added --force flag to re-fetch and update existing data
+// - Now updates incomplete candles instead of skipping them
 // =============================================================================
 
 require('dotenv').config();
@@ -8,18 +13,12 @@ require('dotenv').config();
 const database = require('../database');
 const dukascopy = require('../services/dukascopy-service');
 
-// Configuration
 const CONFIG = {
     yearsToFetch: 5,
-    timeframes: ['D1', 'H4', 'H1', 'M15','M30', 'M5', 'M1'],
+    timeframes: ['D1', 'H4', 'H1', 'M30', 'M15', 'M5', 'M1'],
     chunkDays: {
-        'M1': 7,
-        'M5': 30,
-        'M15': 60,
-        'M30': 90,
-        'H1': 180,
-        'H4': 365,
-        'D1': 365 * 2
+        'M1': 7, 'M5': 30, 'M15': 60, 'M30': 90,
+        'H1': 180, 'H4': 365, 'D1': 365 * 2
     },
     requestDelay: 1000,
     symbols: [
@@ -93,14 +92,13 @@ async function seedSymbolTimeframe(symbol, timeframe, fromDate, toDate) {
         }
     }
 
-    console.log(`\n   ✅ Total inserted for ${symbol} ${timeframe}: ${totalInserted.toLocaleString()} candles`);
+    console.log(`\n   ✅ Total processed for ${symbol} ${timeframe}: ${totalInserted.toLocaleString()} rows`);
     return totalInserted;
 }
 
 async function seedAll(options = {}) {
-    const { years, months } = options;
+    const { years, months, force = false } = options;
     
-    // Calculate date range
     const endDate = new Date();
     const startDate = new Date();
     
@@ -119,6 +117,7 @@ async function seedAll(options = {}) {
     console.log(`📊 Timeframes: ${CONFIG.timeframes.join(', ')}`);
     console.log(`💱 Symbols: ${CONFIG.symbols.length} pairs`);
     console.log(`📆 Range: ${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`);
+    console.log(`🔄 Force update: ${force ? 'YES (will re-fetch all data)' : 'NO (skip existing)'}`);
     console.log('='.repeat(60));
 
     await database.connect();
@@ -142,18 +141,24 @@ async function seedAll(options = {}) {
             const progress = ((currentCombination / totalCombinations) * 100).toFixed(1);
             console.log(`\n📈 [${progress}%] ${symbol} ${timeframe}`);
 
-            const latestExisting = await dukascopy.getLatestTimestamp(symbol, timeframe);
-            
             let fetchFrom = startDate;
-            if (latestExisting) {
-                fetchFrom = new Date(latestExisting);
-                fetchFrom.setMinutes(fetchFrom.getMinutes() + 1);
-                console.log(`   📌 Existing data found, starting from ${fetchFrom.toISOString().split('T')[0]}`);
-            }
 
-            if (fetchFrom >= endDate) {
-                console.log(`   ⭐️ Already up to date, skipping`);
-                continue;
+            // ✅ FIX: Only skip if not forcing and data exists
+            if (!force) {
+                const latestExisting = await dukascopy.getLatestTimestamp(symbol, timeframe);
+                
+                if (latestExisting) {
+                    fetchFrom = new Date(latestExisting);
+                    fetchFrom.setMinutes(fetchFrom.getMinutes() + 1);
+                    console.log(`   📌 Existing data found, starting from ${fetchFrom.toISOString().split('T')[0]}`);
+                }
+
+                if (fetchFrom >= endDate) {
+                    console.log(`   ⭐ Already up to date, skipping (use --force to re-fetch)`);
+                    continue;
+                }
+            } else {
+                console.log(`   🔄 Force mode: re-fetching all data`);
             }
 
             await seedSymbolTimeframe(symbol, timeframe, fetchFrom, endDate);
@@ -169,7 +174,7 @@ async function seedAll(options = {}) {
     console.log('='.repeat(60));
     console.log(`⏱️  Duration: ${formatDuration(duration)}`);
     console.log(`📊 Total candles fetched: ${stats.fetched.toLocaleString()}`);
-    console.log(`💾 Total candles inserted: ${stats.inserted.toLocaleString()}`);
+    console.log(`💾 Total rows processed: ${stats.inserted.toLocaleString()}`);
     console.log(`❌ Errors: ${stats.errors}`);
     console.log('='.repeat(60));
 
@@ -177,7 +182,7 @@ async function seedAll(options = {}) {
 }
 
 async function seedSymbols(symbols, options = {}) {
-    const { timeframes = CONFIG.timeframes, years, months } = options;
+    const { timeframes = CONFIG.timeframes, years, months, force = false } = options;
     
     await database.connect();
 
@@ -193,11 +198,29 @@ async function seedSymbols(symbols, options = {}) {
     const rangeLabel = months ? `${months} month(s)` : `${years || CONFIG.yearsToFetch} year(s)`;
     console.log(`\n🌱 Seeding ${symbols.join(', ')} for ${rangeLabel}`);
     console.log(`📆 Range: ${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]}`);
+    console.log(`🔄 Force update: ${force ? 'YES' : 'NO'}`);
 
     for (const symbol of symbols) {
         for (const timeframe of timeframes) {
             console.log(`\n📈 ${symbol} ${timeframe}`);
-            await seedSymbolTimeframe(symbol, timeframe, startDate, endDate);
+            
+            let fetchFrom = startDate;
+
+            if (!force) {
+                const latestExisting = await dukascopy.getLatestTimestamp(symbol, timeframe);
+                if (latestExisting) {
+                    fetchFrom = new Date(latestExisting);
+                    fetchFrom.setMinutes(fetchFrom.getMinutes() + 1);
+                    
+                    if (fetchFrom >= endDate) {
+                        console.log(`   ⭐ Already up to date, skipping`);
+                        continue;
+                    }
+                    console.log(`   📌 Starting from ${fetchFrom.toISOString().split('T')[0]}`);
+                }
+            }
+
+            await seedSymbolTimeframe(symbol, timeframe, fetchFrom, endDate);
             await sleep(CONFIG.requestDelay);
         }
     }
@@ -226,16 +249,18 @@ Options:
   --years <n>       Number of years to fetch (default: 5)
   --months <n>      Number of months to fetch (overrides --years)
   --timeframe <tf>  Specific timeframe (M1, M5, M15, M30, H1, H4, D1)
+  --force           Re-fetch and UPDATE existing data (fixes incomplete candles)
   --help, -h        Show this help
 
 Examples:
   node scripts/seed-historical.js --months 1           # Last 1 month, all symbols
-  node scripts/seed-historical.js --months 3           # Last 3 months, all symbols
-  node scripts/seed-historical.js EURUSD --months 1    # Last 1 month, EURUSD only
+  node scripts/seed-historical.js --months 3 --force   # Re-fetch last 3 months
+  node scripts/seed-historical.js EURUSD --force       # Re-fetch EURUSD (fix incomplete)
   node scripts/seed-historical.js EURUSD --years 3     # Last 3 years, EURUSD only
   node scripts/seed-historical.js XAUUSD --timeframe D1 --months 6
   
-Note: Duplicates are automatically skipped (INSERT IGNORE on unique key).
+Note: --force will UPDATE existing candles with correct OHLC values from Dukascopy.
+      Use this to fix incomplete candles that were saved before fully forming.
         `);
         return;
     }
@@ -245,6 +270,7 @@ Note: Duplicates are automatically skipped (INSERT IGNORE on unique key).
     let years = null;
     let months = null;
     let timeframes = CONFIG.timeframes;
+    let force = false;
 
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--years' && args[i + 1]) {
@@ -256,12 +282,14 @@ Note: Duplicates are automatically skipped (INSERT IGNORE on unique key).
         } else if (args[i] === '--timeframe' && args[i + 1]) {
             timeframes = [args[i + 1].toUpperCase()];
             i++;
+        } else if (args[i] === '--force') {
+            force = true;
         } else if (!args[i].startsWith('--')) {
             symbols.push(args[i].toUpperCase());
         }
     }
 
-    const options = { years, months, timeframes };
+    const options = { years, months, timeframes, force };
 
     if (symbols.length > 0) {
         await seedSymbols(symbols, options);
