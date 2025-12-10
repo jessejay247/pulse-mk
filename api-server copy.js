@@ -107,7 +107,7 @@
 // });
 
 
-//  node scripts/seed-historical.js EURUSD GBPUSD USDJPY XAUUSD USDCHF AUDUSD USDCAD NZDUSD XAUUSD --months 1 --timeframe M5
+//  node scripts/seed-historical.js EURUSD GBPUSD USDJPY XAUUSD USDCHF AUDUSD USDCAD NZDUSD XAUUSD EURGBP EURJPY GBPJPY --months 1 --timeframe M5
 //  node scripts/seed-historical.js EURUSD GBPUSD --months 1 --timeframe M1
 //  node scripts/seed-historical.js EURUSD GBPUSD --months 1 --timeframe H4
 //  node scripts/seed-historical.js EURUSD GBPUSD --months 1 --timeframe H4
@@ -116,3 +116,6 @@
 // node scripts/seed-historical.js EURUSD --months 1 --timeframe M1
 
 // node scripts/seed-historical.js EURGBP EURJPY GBPJPY --months 1 --timeframe D1
+
+
+// node scripts/nuclear-fix.js EURUSD GBPUSD USDJPY XAUUSD USDCHF AUDUSD USDCAD NZDUSD XAUUSD EURGBP EURJPY GBPJPY --hours 1

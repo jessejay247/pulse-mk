@@ -4,37 +4,44 @@
   "description": "PulseMarkets Self-Healing Forex Data Engine",
   "main": "api-server-v2.js",
   "scripts": {
-    "start": "node api-server-v2.js",
-    "start:engine": "node self-healing-engine.js",
+    "start": "node server.js",
+    "start:healer": "node smart-healing-engine.js",
+    "start:healer:now": "node smart-healing-engine.js --heal-now",
     "dev": "nodemon api-server-v2.js",
+    
+    "seed": "node scripts/seed-historical.js",
+    "seed:primary": "node scripts/seed-historical.js --primary --preset quick",
+    "seed:primary:full": "node scripts/seed-historical.js --primary --preset full",
+    "seed:secondary": "node scripts/seed-historical.js --secondary --preset quick",
+    "seed:all": "node scripts/seed-historical.js --all --preset quick",
+    "seed:all:full": "node scripts/seed-historical.js --all --preset full",
+    
+    "seed:m1:1m": "node scripts/seed-historical.js --primary --timeframe M1 --months 1",
+    "seed:m5:3m": "node scripts/seed-historical.js --primary --timeframe M5 --months 3",
+    "seed:h1:2y": "node scripts/seed-historical.js --primary --timeframe H1 --years 2",
+    "seed:d1:10y": "node scripts/seed-historical.js --all --timeframe D1 --years 10",
+    
+    "nuclear": "node scripts/nuclear-fix.js",
+    "nuclear:eurusd": "node scripts/nuclear-fix.js EURUSD --hours 24",
+    "nuclear:primary": "node scripts/nuclear-fix.js --primary --hours 24",
+    "nuclear:primary:3d": "node scripts/nuclear-fix.js --primary --days 3",
+    "nuclear:all": "node scripts/nuclear-fix.js --all --hours 24",
+    
+    "fix": "node scripts/quick-fix-incomplete.js",
+    "fix:eurusd": "node scripts/quick-fix-incomplete.js EURUSD --hours 24",
+    "fix:primary": "node scripts/quick-fix-incomplete.js --hours 24",
     
     "ops": "node scripts/manual-operations.js",
     "ops:health": "node scripts/manual-operations.js health",
     "ops:gaps": "node scripts/manual-operations.js gaps --primary",
     "ops:gaps:fix": "node scripts/manual-operations.js gaps --primary --fix",
-    
-    "backfill": "node scripts/manual-operations.js backfill",
-    "backfill:eurusd": "node scripts/manual-operations.js backfill EURUSD --days 7",
-    "backfill:primary": "node scripts/manual-operations.js backfill EURUSD GBPUSD USDJPY XAUUSD --days 7",
-    
-    "verify": "node scripts/manual-operations.js verify",
-    "verify:all": "node scripts/manual-operations.js verify EURUSD M1 --days 7",
-    
-    "fix": "node scripts/manual-operations.js fix-incomplete",
-    "rebuild": "node scripts/manual-operations.js rebuild",
-    
-    "seed": "node scripts/seed-historical.js",
-    "seed:majors": "node scripts/seed-historical.js EURUSD GBPUSD USDJPY USDCHF AUDUSD USDCAD NZDUSD --months 1",
-    "seed:metals": "node scripts/seed-historical.js XAUUSD XAGUSD --months 1",
-    "seed:primary": "node scripts/seed-historical.js EURUSD GBPUSD USDJPY XAUUSD USDCHF AUDUSD USDCAD NZDUSD EURGBP EURJPY GBPJPY --months 1",
-    "seed:force": "node scripts/seed-historical.js --force --months 1",
+    "ops:verify": "node scripts/manual-operations.js verify",
     
     "cleanup": "node scripts/cleanup-closed-market.js",
     "cleanup:execute": "node scripts/cleanup-closed-market.js --execute",
     
     "legacy:start": "node api-server.js",
     "legacy:ingestion": "node finnhub-app.js",
-    "legacy:data-manager": "node scripts/data-manager.js",
     
     "test": "echo \"No tests yet\" && exit 0"
   },
